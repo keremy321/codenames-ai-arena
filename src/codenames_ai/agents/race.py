@@ -1,6 +1,6 @@
 """Codenames as a race: win probability from both teams' remaining cards.
 
-Both teams alternate turns; on a typical future turn a team clears 0, 1, 2 or 3
+Both teams alternate turns; on a typical future turn a team clears 0 to 4
 cards with the probabilities in ``RaceModel.progress``. Whoever clears its last card
 first wins. From that small Markov model we get, for any position, the probability
 that we win the match. A clue is then worth the win probability of the position it
@@ -16,9 +16,11 @@ from functools import cache
 
 @dataclass(frozen=True)
 class RaceModel:
-    # P(a typical future turn clears 0, 1, 2, 3 cards). Mean 1.35 cards per turn, in
-    # line with the offline harness for these agents; used for both teams.
-    progress: tuple[float, ...] = (0.15, 0.45, 0.30, 0.10)
+    # P(a typical FUTURE turn clears 0, 1, 2, 3, 4 cards), used for both teams' later
+    # turns only; the current clue is valued from its own predicted outcomes. Mean
+    # 1.47 cards per turn: the harness averages ~1.5 hits for these agents, and a
+    # slower prior would undervalue tempo and push the spymaster toward one-card clues.
+    progress: tuple[float, ...] = (0.15, 0.42, 0.28, 0.11, 0.04)
 
     def __post_init__(self) -> None:
         if abs(sum(self.progress) - 1.0) > 1e-9 or self.progress[0] >= 1.0:

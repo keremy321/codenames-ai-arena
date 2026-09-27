@@ -1,17 +1,20 @@
-"""Spymaster: the model proposes clues; our simulated operative and the race decide.
+"""Spymaster: search target groups, keep each (clue, number) action intact, pick the
+action with the highest match win probability.
 
-Normal cost is three qwen3 calls per clue:
-1. generate: associations for each friendly word (specific and broad), then a few
-   multi-target plans, with the race situation in the prompt. Code adds exact
-   association overlaps and precise single-target clues from the same lists.
-2. screen: one batched colour-blind ranking for up to 10 candidates.
-3. verify: the best screened candidate is ranked again with the operative's exact
-   single-clue request, which reproduces the operative's own ranking. A second or
-   third finalist is verified only if the first disappoints.
-Every candidate is scored locally by clue_scoring: simulated operative outcomes,
-valued by match win probability (race.py); no model call is spent on strategy. Only
-if no screened candidate is acceptable, one more screen runs on reserve single-target
-ideas. Nothing bypasses the colour-blind check; there are no open-ended retries.
+Per clue the normal cost is 3-6 qwen3 calls:
+1. generate: per friendly word two themes (categories, functions, properties) and two
+   specific single-word ideas, then 4-8 target GROUPS (2 up to min(4, our cards) words)
+   with a clue and a short private connection. The race situation sets the search
+   order; in a critical endgame it asks for an all-remaining group first.
+   Code adds exact theme overlaps (multi-word) and specific single-word fallbacks.
+2. focused regeneration, at most once and only if multi-card plans are nearly absent
+   when behind/critical, or a critical endgame has no all-in attempt.
+3. screen: one batched colour-blind ranking; multi-word clues fill most of the pool,
+   single-word fallbacks the rest.
+4. verify (1-3 short calls, +2 at most for the final choice): the operative's exact
+   single-clue request. It re-scores every action of that clue with the SAME numbers.
+Every action is scored locally (clue_scoring + race); no call is spent on strategy.
+Nothing bypasses the colour-blind check, and there are no open-ended retries.
 """
 
 import logging
@@ -42,7 +45,8 @@ from .clue_scoring import (
     ClueAssessment,
     ClueUtility,
     Side,
-    assess_clue,
+    assess_actions,
+    best_by_size,
     explain_choice,
     select_clue,
     side_of,
@@ -51,34 +55,51 @@ from .race import RaceState
 
 logger = logging.getLogger(__name__)
 
-POOL_SIZE = 10
+POOL_SIZE = 10  # clue words per screening call
+POOL_SINGLES = 3  # single-word fallbacks in the first screen when multi-word ideas exist
 MAX_VERIFY = 3
 # Batched screening misjudges multi-word clues most (it over- or under-lists
 # competitors), so a finalist whose screened win probability is within this margin of
-# the best verified clue is verified too, up to MAX_VERIFY. Each check is ~1-2 s.
+# the best verified action is verified too, up to MAX_VERIFY. Each check is ~1-2 s.
 VERIFY_MARGIN = 0.10
 FINAL_CHECKS = 2
-ASSOCIATIONS_PER_KIND = 3
+THEMES_PER_WORD = 2
+SPECIFIC_PER_WORD = 2
 GENERATOR_TEMPERATURE = 0.4
+# Real clue words longer than this are rare; glued phrases (MUSICALINSTRUMENT) are not.
+MAX_CLUE_LETTERS = 13
 _CLUE_PATTERN = re.compile(r"[^\W\d_]+(?:[-'][^\W\d_]+)*")
+# Enforced by the JSON grammar for every generated idea and clue: one word, no spaces,
+# no internal capitals. Without it qwen3 answers with phrases ("Erupting mountain"), and
+# with a looser pattern it glues them into CamelCase ("EruptingMountain").
+WORD_SCHEMA = {"type": "string", "pattern": "^[A-Za-z][a-z]*(-[a-z]+)?$"}
 
 GUIDANCE = {
-    "last card": "Only one of your words is left: give a precise clue for it.",
+    "last card": "Only one of your words is left: give precise clues for it.",
     "critical": (
-        "The opponent will probably win on its next turn. Search hard for a clue that "
-        "connects as many of your remaining words as possible, ideally all of them; a "
-        "one-word clue now probably loses the game."
+        "The opponent is very likely to win on its next turn. Search aggressively for a "
+        "clue that can finish ALL of your remaining words now. If no credible clue covers "
+        "all of them, find the strongest group one smaller, then smaller again. A safe "
+        "one-word clue is strategically poor unless no credible multi-word option exists."
     ),
     "behind": (
-        "You are behind. A series of one-word clues will likely lose the race: actively "
-        "look for strong two- and three-word connections."
+        "You are behind. A series of one-word clues will lose the race: spend your effort "
+        "on genuine two-, three- and (if natural) four-word groups."
     ),
-    "even": "The race is close: prefer clues that safely connect two or three of your words.",
+    "even": "The race is close: look first for clues that safely connect two or three words.",
     "ahead": (
-        "You are ahead: prefer safe, efficient clues and take no unnecessary risk; the "
-        "assassin and opponent words matter more than speed."
+        "You are ahead: prefer safe, coherent groups of two or three; take no unnecessary "
+        "risk with the assassin or opponent words."
     ),
 }
+
+STYLE = (
+    "Good groups share ONE natural concept: a category, a function, a physical property, "
+    "a cultural association, an action, or a domain. Bad clues: generic words like "
+    "OBJECT, THING or ITEM; forcing unrelated words together; a link that only works "
+    "because you know which words are yours; invented compounds. Prefer a smaller coherent "
+    "group over a larger fake one, and never pad a group with an unrelated word."
+)
 
 
 def _is_board_derivative(clue: str, board_words: set[str]) -> bool:
@@ -106,8 +127,10 @@ def _is_board_derivative(clue: str, board_words: set[str]) -> bool:
 
 def clue_problem(clue: str, board_words: set[str]) -> str | None:
     """Local rule check; returns why a clue word is illegal, or None."""
-    if not _CLUE_PATTERN.fullmatch(clue) or len(clue) > 24:
+    if not _CLUE_PATTERN.fullmatch(clue):
         return "not a single plain word"
+    if len(clue) > MAX_CLUE_LETTERS:
+        return "too long; likely a glued compound"
     if _is_board_derivative(clue, board_words):
         return "repeats, contains, or derives from a board word"
     return None
@@ -123,9 +146,12 @@ def _stem(word: str) -> str:
 
 @dataclass(frozen=True)
 class Candidate:
+    """A clue word with the friendly words it was generated for."""
+
     clue: str
     targets: tuple[str, ...]
-    source: str  # model | overlap | specific | given
+    source: str  # model | focus | overlap | specific | given
+    connection: str = ""  # private generation note; never sent to any ranking request
 
 
 @dataclass(frozen=True)
@@ -143,9 +169,11 @@ class SpymasterTrace:
     team: Team
     race: RaceState | None = None
     calls: list[LLMCall] = field(default_factory=list)
-    associations: dict[str, dict[str, list[str]]] = field(default_factory=dict)
+    words: dict[str, dict[str, list[str]]] = field(default_factory=dict)
     candidates: list[Candidate] = field(default_factory=list)
     rejected: list[tuple[str, str]] = field(default_factory=list)
+    generated_sizes: dict[int, int] = field(default_factory=dict)
+    focused_regeneration: str = ""  # why the one extra generation ran, if it did
     screened: list[ClueAssessment] = field(default_factory=list)
     verified: list[ClueAssessment] = field(default_factory=list)
     assessments: list[ClueAssessment] = field(default_factory=list)  # final estimates
@@ -153,6 +181,10 @@ class SpymasterTrace:
     fallback_round: bool = False
     explanation: str = ""
     note: str = ""
+
+    @property
+    def associations(self) -> dict[str, dict[str, list[str]]]:  # harness compatibility
+        return self.words
 
 
 @dataclass(frozen=True)
@@ -164,6 +196,13 @@ class _Board:
     unrevealed: tuple[str, ...]  # card-index order, exactly as the operative lists them
     all_words: frozenset[str]
     sides: Mapping[str, Side]
+
+
+def size_counts(candidates: Sequence[Candidate], max_number: int) -> dict[int, int]:
+    counts = {n: 0 for n in range(1, max_number + 1)}
+    for c in candidates:
+        counts[min(len(c.targets), max_number)] += 1
+    return counts
 
 
 class SpymasterAgent(Agent):
@@ -222,6 +261,9 @@ class SpymasterAgent(Agent):
                 missed.append((record.clue, words))
         return missed
 
+    def _max_group(self, race: RaceState) -> int:
+        return min(self.utility.max_number, race.ours)
+
     async def choose_clue(
         self, state: SpymasterGameState, *, candidates: Sequence[Candidate] | None = None
     ) -> ClueDecision:
@@ -234,13 +276,19 @@ class SpymasterAgent(Agent):
         if candidates is None:
             pool = await self._candidates(board, race, trace, self.missed_targets(state))
         else:
-            given = [(c.clue, c.targets, "given") for c in candidates]
+            given = [(c.clue, c.targets, "given", c.connection) for c in candidates]
             pool = self._prepare(board, trace, given)
-        first, reserve = pool[:POOL_SIZE], pool[POOL_SIZE:]
+        trace.generated_sizes = size_counts(trace.candidates, self.utility.max_number)
+        logger.info(
+            "[%s] generated: %s",
+            self.team,
+            " ".join(f"n{n}={k}" for n, k in trace.generated_sizes.items()),
+        )
+        first, reserve = self._split_pool(pool)
         screened = await self._screen(board, race, trace, first)
         if not any(a.acceptable for a in screened) and reserve:
             trace.fallback_round = True
-            logger.info("[%s] no acceptable clue; screening reserve clues", self.team)
+            logger.info("[%s] no acceptable action; screening reserve clues", self.team)
             screened += await self._screen(board, race, trace, reserve[:POOL_SIZE])
         trace.screened = screened
         trace.assessments = await self._verify(board, race, trace, screened)
@@ -250,12 +298,23 @@ class SpymasterAgent(Agent):
             logger.error("[%s] no safe clue: %s", self.team, describe_calls(trace.calls))
             raise ValueError(f"No safe clue after {len(trace.calls)} Ollama calls: {trace.note}")
         if not choice.acceptable:
-            trace.note = "no acceptable clue; using the least bad non-vetoed candidate"
+            trace.note = "no acceptable action; using the least bad non-vetoed candidate"
             logger.warning("[%s] %s", self.team, trace.note)
         trace.selected = choice
         trace.explanation = explain_choice(choice, trace.assessments, race)
         self.used_clues.add(choice.clue.casefold())
         self.memory.append(PrivateClue(choice.clue, choice.number, choice.intended, choice.hits))
+        sizes = best_by_size(trace.assessments)
+        logger.info(
+            "[%s] best by size: %s",
+            self.team,
+            "; ".join(
+                f"n{n} {a.clue} {a.number} win={a.win_probability:.3f}"
+                f"{'' if a.verified else ' (screened)'}"
+                for n, a in sizes.items()
+            )
+            or "-",
+        )
         logger.info(
             "[%s] selected %s %d (%s; %s); expected %s; intended %s; reason: %s; %s",
             self.team,
@@ -270,6 +329,16 @@ class SpymasterAgent(Agent):
         )
         return ClueDecision(word=choice.clue, number=choice.number)
 
+    @staticmethod
+    def _split_pool(pool: Sequence[Candidate]) -> tuple[list[Candidate], list[Candidate]]:
+        """First screen: multi-word clues first, with a few single-word fallbacks."""
+        multi = [c for c in pool if len(c.targets) > 1]
+        singles = [c for c in pool if len(c.targets) == 1]
+        n_singles = min(len(singles), max(POOL_SINGLES, POOL_SIZE - len(multi)))
+        first = multi[: POOL_SIZE - n_singles] + singles[:n_singles]
+        chosen = {c.clue for c in first}
+        return first, [c for c in pool if c.clue not in chosen]
+
     async def _candidates(
         self,
         board: _Board,
@@ -277,31 +346,57 @@ class SpymasterAgent(Agent):
         trace: SpymasterTrace,
         missed: Sequence[tuple[str, tuple[str, ...]]],
     ) -> list[Candidate]:
-        """One generation call (one retry only if its JSON is unusable)."""
+        """One generation call (one retry only if its JSON is unusable), plus at most one
+        focused regeneration when multi-word plans are missing where they matter."""
         reply: dict[str, Any] | None = None
         for attempt in range(2):
             try:
-                reply = await self._generate(board, race, trace, missed)
+                reply = await self._generate(board, race, trace, missed, focus=False)
                 break
             except OllamaResponseError as exc:
                 logger.warning("[%s] generation attempt %d failed: %s", self.team, attempt + 1, exc)
         if reply is None:
             return []
-        friendly = {word.casefold(): word for word in board.friendly}
-        associations: dict[str, dict[str, list[str]]] = {}
-        raw_assoc = reply.get("associations")
-        for word in board.friendly:
-            entry = raw_assoc.get(word) if isinstance(raw_assoc, dict) else None
-            entry = entry if isinstance(entry, dict) else {}
-            associations[word] = {
-                kind: [str(a).strip() for a in entry.get(kind, []) if isinstance(a, str)]
-                for kind in ("specific", "broad")
-            }
-        trace.associations = associations
+        ordered = self._plans(board, trace, reply, "model")
+        pool = self._prepare(board, trace, ordered)
+        # At most ONE extra generation: a retry if nothing legal came back, otherwise a
+        # focused multi-word search when it matters.
+        reason = (
+            "no legal clue in the first generation" if not pool else self._needs_focus(race, pool)
+        )
+        if reason:
+            trace.focused_regeneration = reason
+            logger.info("[%s] focused multi-word regeneration: %s", self.team, reason)
+            try:
+                extra = await self._generate(board, race, trace, missed, focus=True)
+                ordered += self._plans(board, trace, extra, "focus")
+                pool = self._prepare(board, trace, ordered)
+            except OllamaResponseError as exc:
+                logger.warning("[%s] focused regeneration failed: %s", self.team, exc)
+        return pool
 
-        ordered: list[tuple[str, Sequence[str], str]] = []
-        raw_plans = reply.get("candidates")
-        for plan in raw_plans if isinstance(raw_plans, list) else []:
+    def _needs_focus(self, race: RaceState, pool: Sequence[Candidate]) -> str:
+        multi = [c for c in pool if len(c.targets) > 1]
+        if race.ours >= 4 and race.pressure in ("behind", "critical") and len(multi) < 2:
+            return (
+                f"{race.pressure} with {race.ours} cards left but {len(multi)} multi-word plan(s)"
+            )
+        all_in = self._max_group(race)
+        if (
+            race.pressure == "critical"
+            and all_in >= 3
+            and not any(len(c.targets) >= all_in for c in pool)
+        ):
+            return f"critical endgame without a {all_in}-word attempt"
+        return ""
+
+    def _plans(
+        self, board: _Board, trace: SpymasterTrace, reply: Mapping[str, Any], source: str
+    ) -> list[tuple[str, Sequence[str], str, str]]:
+        friendly = {word.casefold(): word for word in board.friendly}
+        ordered: list[tuple[str, Sequence[str], str, str]] = []
+        raw_groups = reply.get("groups")
+        for plan in raw_groups if isinstance(raw_groups, list) else []:
             if not isinstance(plan, dict):
                 continue
             targets = [
@@ -309,70 +404,76 @@ class SpymasterAgent(Agent):
                 for t in plan.get("targets", [])
                 if isinstance(t, str) and t.casefold() in friendly
             ]
-            ordered.append((str(plan.get("clue", "")).strip(), targets, "model"))
-        # Exact overlaps between association lists: a shared idea for 2-3 of our words.
+            connection = str(plan.get("connection", ""))[:80]
+            ordered.append((str(plan.get("clue", "")).strip(), targets, source, connection))
+        raw_words = reply.get("words")
+        if not isinstance(raw_words, dict):
+            return ordered
+        words: dict[str, dict[str, list[str]]] = {}
+        for word in board.friendly:
+            entry = raw_words.get(word)
+            entry = entry if isinstance(entry, dict) else {}
+            words[word] = {
+                kind: [str(a).strip() for a in entry.get(kind, []) if isinstance(a, str)]
+                for kind in ("themes", "specific")
+            }
+        trace.words = words
+        # Exact theme overlaps: a shared idea for 2+ of our words (multi-word by nature).
         by_stem: dict[str, tuple[str, list[str]]] = {}
-        for word, kinds in associations.items():
-            for assoc in kinds["broad"] + kinds["specific"]:
-                _, words = by_stem.setdefault(_stem(assoc), (assoc, []))
-                if word not in words:
-                    words.append(word)
-        overlaps = sorted(
-            ((spelled, words) for spelled, words in by_stem.values() if len(words) >= 2),
-            key=lambda item: -len(item[1]),
-        )
-        ordered += [(clue, targets, "overlap") for clue, targets in overlaps]
-        # Precise single-target clues: first choices first, then second choices...
-        for rank in range(ASSOCIATIONS_PER_KIND):
-            for word, kinds in associations.items():
+        for word, kinds in words.items():
+            for idea in kinds["themes"] + kinds["specific"]:
+                _, members = by_stem.setdefault(_stem(idea), (idea, []))
+                if word not in members:
+                    members.append(word)
+        for spelled, members in sorted(by_stem.values(), key=lambda item: -len(item[1])):
+            if len(members) >= 2:
+                ordered.append((spelled, members, "overlap", "shared theme"))
+        # Specific single-word fallbacks: first choices first, then second choices.
+        for rank in range(SPECIFIC_PER_WORD):
+            for word, kinds in words.items():
                 if rank < len(kinds["specific"]):
-                    ordered.append((kinds["specific"][rank], [word], "specific"))
-        return self._prepare(board, trace, ordered)
+                    ordered.append((kinds["specific"][rank], [word], "specific", ""))
+        return ordered
 
     def _prepare(
         self,
         board: _Board,
         trace: SpymasterTrace,
-        ordered: Sequence[tuple[str, Sequence[str], str]],
+        ordered: Sequence[tuple[str, Sequence[str], str, str]],
     ) -> list[Candidate]:
-        """Legal, distinct, never-used clues in canonical spelling; multi-target first."""
+        """Legal, distinct, never-used clues in canonical spelling; multi-word first.
+
+        A clue word proposed more than once keeps its largest coherent target group.
+        """
         friendly = {word.casefold(): word for word in board.friendly}
-        candidates: list[Candidate] = []
-        # A repeated clue word would make the team's public clue memory ambiguous.
-        seen: set[str] = {_stem(clue) for clue in self.used_clues}
+        cap = min(self.utility.max_number, len(board.friendly))
+        used = {_stem(clue) for clue in self.used_clues}
         board_words = set(board.all_words)
-        for clue, raw_targets, source in ordered:
+        by_stem: dict[str, Candidate] = {}
+        trace.rejected = []
+        for clue, raw_targets, source, connection in ordered:
             targets = tuple(
                 dict.fromkeys(
                     friendly[t.casefold()] for t in raw_targets if t.casefold() in friendly
                 )
-            )
+            )[:cap]
             problem = clue_problem(clue, board_words)
             if problem is None and not targets:
                 problem = "no valid friendly targets"
-            if problem is None and _stem(clue) in seen:
-                continue  # quietly skip duplicates of a better-ranked candidate
+            if problem is None and _stem(clue) in used:
+                problem = "already used by this team"
             if problem is not None:
                 trace.rejected.append((clue or "<empty>", f"{source}: {problem}"))
                 continue
-            seen.add(_stem(clue))
-            candidates.append(
-                Candidate(canonical_clue(clue), targets[: self.utility.max_number], source)
-            )
-        trace.candidates = candidates
-        logger.info(
-            "[%s] %d candidates (%s); %d dropped",
-            self.team,
-            len(candidates),
-            ", ".join(
-                f"{sum(c.source == src for c in candidates)} {src}"
-                for src in ("model", "overlap", "specific", "given")
-                if any(c.source == src for c in candidates)
-            ),
-            len(trace.rejected),
+            key = _stem(clue)
+            if key not in by_stem or len(targets) > len(by_stem[key].targets):
+                by_stem[key] = Candidate(canonical_clue(clue), targets, source, connection)
+        candidates = sorted(
+            by_stem.values(),
+            key=lambda c: (len(c.targets) == 1, c.source in ("specific", "overlap")),
         )
-        # Multi-target ideas first, then precise singles; singles fill the reserve.
-        return sorted(candidates, key=lambda c: (len(c.targets) == 1, c.source == "specific"))
+        trace.candidates = candidates
+        return candidates
 
     async def _generate(
         self,
@@ -380,21 +481,31 @@ class SpymasterAgent(Agent):
         race: RaceState,
         trace: SpymasterTrace,
         missed: Sequence[tuple[str, tuple[str, ...]]],
+        *,
+        focus: bool,
     ) -> dict[str, Any]:
-        association_list = {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": ASSOCIATIONS_PER_KIND,
-            "maxItems": ASSOCIATIONS_PER_KIND,
-        }
-        properties: dict[str, Any] = {
-            "associations": {
+        cap = self._max_group(race)
+        idea_list = {"type": "array", "items": WORD_SCHEMA}
+        properties: dict[str, Any] = {}
+        if not focus or not trace.candidates:
+            properties["words"] = {
                 "type": "object",
                 "properties": {
                     word: {
                         "type": "object",
-                        "properties": {"specific": association_list, "broad": association_list},
-                        "required": ["specific", "broad"],
+                        "properties": {
+                            "themes": {
+                                **idea_list,
+                                "minItems": THEMES_PER_WORD,
+                                "maxItems": THEMES_PER_WORD,
+                            },
+                            "specific": {
+                                **idea_list,
+                                "minItems": SPECIFIC_PER_WORD,
+                                "maxItems": SPECIFIC_PER_WORD,
+                            },
+                        },
+                        "required": ["themes", "specific"],
                         "additionalProperties": False,
                     }
                     for word in board.friendly
@@ -402,13 +513,11 @@ class SpymasterAgent(Agent):
                 "required": list(board.friendly),
                 "additionalProperties": False,
             }
-        }
-        multi = len(board.friendly) >= 2
-        if multi:
-            properties["candidates"] = {
+        if cap >= 2:
+            properties["groups"] = {
                 "type": "array",
-                "minItems": 3,
-                "maxItems": 5,
+                "minItems": 3 if focus else 4,
+                "maxItems": 8,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -416,11 +525,12 @@ class SpymasterAgent(Agent):
                             "type": "array",
                             "items": {"type": "string", "enum": list(board.friendly)},
                             "minItems": 2,
-                            "maxItems": min(self.utility.max_number, len(board.friendly)),
+                            "maxItems": cap,
                         },
-                        "clue": {"type": "string"},
+                        "clue": WORD_SCHEMA,
+                        "connection": {"type": "string"},
                     },
-                    "required": ["targets", "clue"],
+                    "required": ["targets", "clue", "connection"],
                     "additionalProperties": False,
                 },
             }
@@ -434,18 +544,23 @@ class SpymasterAgent(Agent):
             f"You are the {self.team.value.upper()} spymaster in Codenames, racing the other "
             "team to reveal all of your words first. A clue is ONE real English dictionary "
             "word (no spaces, no made-up compounds) that is not a board word, part of one, or "
-            "a form of one. First, for each of your words give single-word clue ideas: "
-            "'specific' ideas point to that word alone; 'broad' ideas are categories or "
-            "themes that could also cover other words."
+            "a form of one. " + STYLE
         )
-        if multi:
+        if "words" in properties:
             system += (
-                " Then propose clues that connect 2 or 3 of your words through one real, "
-                "common association (category, synonym, well-known phrase, shared property). "
-                "Never force a link because words are yours."
+                " First, for each of your words give two themes (categories, functions, "
+                "properties, domains it belongs to) and two specific clue ideas that point "
+                "to that word alone."
+            )
+        if cap >= 2:
+            system += (
+                " Then find GROUPS of your words that share one defensible concept: look at "
+                f"pairs, triples{' and groups of four' if cap >= 4 else ''}, and give each "
+                "group a clue and a short connection (at most six words, for your notes). "
+                "Most of your effort should go into these groups."
             )
         system += (
-            " Avoid any idea that also fits an opponent word, a neutral word, or above all "
+            " Avoid any clue that also fits an opponent word, a neutral word, or above all "
             "the assassin."
         )
         lines = [
@@ -456,10 +571,25 @@ class SpymasterAgent(Agent):
             f"RACE: you have {race.ours} words left, the opponent has {race.theirs}. "
             + GUIDANCE[race.pressure],
         ]
-        if 2 <= race.ours <= self.utility.max_number:
+        if race.pressure == "critical" and cap >= 2:
+            order = ", then ".join(f"a credible {n}-word clue" for n in range(cap, 1, -1))
+            lines.append(f"Search order: {order}; a one-word clue only as a last resort.")
+        elif 2 <= race.ours <= self.utility.max_number:
             lines.append(
                 f"One clue connecting all {race.ours} of your remaining words would win the "
-                "game now; include such a candidate if any real link exists."
+                "game now; include such a group if any real link exists."
+            )
+        if focus and not trace.candidates:
+            lines.append(
+                "Your earlier suggestions were not usable single words. Every idea and clue "
+                "must be ONE real dictionary word."
+            )
+        elif focus:
+            lines.append(
+                "Your earlier suggestions had too few multi-word groups. Give ONLY groups: "
+                f"the most coherent pairs, triples{' and fours' if cap >= 4 else ''} you can "
+                "find. Do not repeat these clues: "
+                + (", ".join(c.clue for c in trace.candidates) or "-")
             )
         if missed:
             lines.append(
@@ -472,24 +602,23 @@ class SpymasterAgent(Agent):
         return await timed_chat(
             self.llm,
             trace.calls,
-            "generate",
+            "generate-focus" if focus else "generate",
             system=system,
             user="\n".join(lines),
             schema=schema,
-            num_predict=900,
+            num_predict=700 if focus else 1000,
             temperature=GENERATOR_TEMPERATURE,
         )
 
-    def _log(self, stage: str, board: _Board, candidate: Candidate, a: ClueAssessment) -> None:
+    def _log(self, stage: str, board: _Board, a: ClueAssessment) -> None:
         labels = {w: s.value[0].upper() for w, s in board.sides.items()}
         logger.info(
-            "[%s]   %s %s %d (%s, intended %s): %s | %s | %s",
+            "[%s]   %s %s %d (intended %s): %s | %s | %s",
             self.team,
             stage,
             a.clue,
             a.number,
-            candidate.source,
-            list(candidate.targets),
+            list(a.intended),
             a.metrics(),
             "ok" if a.acceptable else f"rejected: {a.reason}",
             format_ranking(a.ranking, labels),
@@ -507,14 +636,19 @@ class SpymasterAgent(Agent):
         rankings = await self._batched_rankings(board, trace, candidates)
         if rankings is None:
             return []  # unassessed candidates are never used
-        assessments = []
+        assessments: list[ClueAssessment] = []
         for candidate in candidates:
-            ranking = rankings.get(candidate.clue, ())
-            assessment = assess_clue(
-                candidate.clue, candidate.targets, ranking, board.sides, race, self.utility
+            actions = assess_actions(
+                candidate.clue,
+                candidate.targets,
+                rankings.get(candidate.clue, ()),
+                board.sides,
+                race,
+                self.utility,
             )
-            assessments.append(assessment)
-            self._log("screen", board, candidate, assessment)
+            for action in actions:
+                self._log("screen", board, action)
+            assessments += actions
         return assessments
 
     async def _verify(
@@ -524,69 +658,83 @@ class SpymasterAgent(Agent):
         trace: SpymasterTrace,
         screened: Sequence[ClueAssessment],
     ) -> list[ClueAssessment]:
-        """Re-rank the most promising candidates with the operative's exact request.
+        """Re-rank the most promising clues with the operative's exact request.
 
-        The screened (batched) ranking is only an estimate: batching and clue spelling
-        change qwen3's answer. The verified ranking is what the operative will see.
+        The verified ranking replaces the screened one for EVERY action of that clue,
+        with exactly the same numbers: (MOTION, 3) stays (MOTION, 3), better or worse.
         """
-        finalists = sorted(
-            (a for a in screened if not a.vetoed and a.ranking),
-            key=lambda a: (a.acceptable, a.win_probability),
-            reverse=True,
-        )
-        final = {a.clue: a for a in screened}
-        for position, screened_one in enumerate(finalists[:MAX_VERIFY]):
-            verified = await self._verify_one(board, race, trace, screened_one)
-            if verified is None:
-                continue
-            final[verified.clue] = verified
-            best = select_clue([v for v in trace.verified if v.acceptable])
-            upcoming = finalists[position + 1] if position + 1 < len(finalists) else None
-            # Stop once no unverified finalist could plausibly beat the verified best.
+        final = {a.action: a for a in screened}
+        verified_clues: set[str] = set()
+
+        def finalists() -> list[ClueAssessment]:
+            return sorted(
+                (a for a in final.values() if not a.vetoed and a.ranking and not a.verified),
+                key=lambda a: (a.acceptable, a.win_probability),
+                reverse=True,
+            )
+
+        for _ in range(MAX_VERIFY):
+            pending = finalists()
+            if not pending:
+                break
+            await self._verify_clue(board, race, trace, pending[0].clue, final, verified_clues)
+            best = select_clue([a for a in final.values() if a.verified and a.acceptable])
+            upcoming = finalists()
+            # Stop once no unverified action could plausibly beat the verified best.
             if best is not None and (
-                upcoming is None or upcoming.win_probability < best.win_probability - VERIFY_MARGIN
+                not upcoming or upcoming[0].win_probability < best.win_probability - VERIFY_MARGIN
             ):
                 break
-        # Never submit a clue whose ranking was only screened: if the best estimate is
-        # still unverified (the verified finalists disappointed), verify it and re-select.
+        # Never submit an action whose ranking was only screened.
         for _ in range(FINAL_CHECKS):
             choice = select_clue(list(final.values()))
-            if choice is None or choice.verified:
+            if choice is None or choice.verified or choice.clue in verified_clues:
                 break
-            verified = await self._verify_one(board, race, trace, choice)
-            if verified is None:
-                break
-            final[verified.clue] = verified
+            await self._verify_clue(board, race, trace, choice.clue, final, verified_clues)
         return list(final.values())
 
-    async def _verify_one(
-        self, board: _Board, race: RaceState, trace: SpymasterTrace, screened: ClueAssessment
-    ) -> ClueAssessment | None:
-        request = single_clue_request(screened.clue, board.unrevealed)
+    async def _verify_clue(
+        self,
+        board: _Board,
+        race: RaceState,
+        trace: SpymasterTrace,
+        clue: str,
+        final: dict[tuple[str, int], ClueAssessment],
+        verified_clues: set[str],
+    ) -> None:
+        verified_clues.add(clue)
+        actions = [a for a in final.values() if a.clue == clue]
+        request = single_clue_request(clue, board.unrevealed)
         try:
             reply = await timed_chat(self.llm, trace.calls, "verify", **request)
         except OllamaResponseError as exc:
-            logger.warning("[%s] verifying %s failed: %s", self.team, screened.clue, exc)
-            return None
-        verified = assess_clue(
-            screened.clue,
-            screened.intended,
-            parse_single(reply, screened.clue, board.unrevealed),
+            logger.warning("[%s] verifying %s failed: %s", self.team, clue, exc)
+            return
+        numbers = [a.number for a in actions]
+        rescored = assess_actions(
+            clue,
+            actions[0].intended,
+            parse_single(reply, clue, board.unrevealed),
             board.sides,
             race,
             self.utility,
+            numbers=numbers,
             verified=True,
         )
-        trace.verified.append(verified)
-        candidate = next(c for c in trace.candidates if c.clue == verified.clue)
-        self._log("verify", board, candidate, verified)
-        return verified
+        for before, after in zip(actions, rescored, strict=True):
+            # Candidate identity is (clue, number): verification may reject an action
+            # but must never turn it into a different one.
+            if after.action != before.action:
+                raise AssertionError(f"verification changed {before.action} to {after.action}")
+            final[after.action] = after
+            trace.verified.append(after)
+            self._log(f"VERIFY {after.clue} {after.number}:", board, after)
 
     async def _batched_rankings(
         self, board: _Board, trace: SpymasterTrace, candidates: Sequence[Candidate]
     ) -> dict[str, tuple[RankedWord, ...]] | None:
-        # Colour-blind on purpose: only unrevealed words and clue words, never the key
-        # or the intended targets, so the ranking predicts what our operative will do.
+        # Colour-blind on purpose: only unrevealed words and clue words, never the key,
+        # the intended targets, or the private connection notes.
         clues = [c.clue for c in candidates]
         try:
             reply = await timed_chat(

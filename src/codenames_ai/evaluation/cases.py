@@ -45,7 +45,7 @@ class SpymasterCase:
     purpose: str
     board: Board
     min_number: int = 1
-    max_number: int = 3
+    max_number: int = 4
     target_pool: frozenset[str] | None = None  # good plans only use these words
     avoid: frozenset[str] = frozenset()  # never guessed, never ranked above our words
     memory: tuple[PrivateClue, ...] = ()
@@ -56,6 +56,9 @@ class SpymasterCase:
     candidates: tuple[tuple[str, tuple[str, ...]], ...] | None = None
     expect_clue: str | None = None
     expect_win: bool = False
+    reject_clue: str | None = None
+    min_multi_generated: int = 0  # generation diagnostic (generated cases only)
+    min_largest_generated: int = 0  # the largest generated group must reach this size
 
 
 @dataclass(frozen=True)
@@ -151,7 +154,7 @@ SPYMASTER_CASES: tuple[SpymasterCase, ...] = (
     ),
     SpymasterCase(
         name="hard_board_one",
-        purpose="Every friendly word has a close opponent/neutral/assassin twin; 1 is safest.",
+        purpose="Every friendly word has an opponent/neutral/assassin twin; no enemy or KING.",
         board=Board(
             blue=(
                 "GUITAR",
@@ -168,7 +171,6 @@ SPYMASTER_CASES: tuple[SpymasterCase, ...] = (
             neutral=("DRUM", "SHIP", "MOUNTAIN", "PAPER", "JUNGLE", "TOWER", "CLOCK"),
             assassin="KING",
         ),
-        max_number=1,
         avoid=frozenset({"KING"}),
     ),
     SpymasterCase(
@@ -284,6 +286,7 @@ SPYMASTER_CASES: tuple[SpymasterCase, ...] = (
         ),
         min_number=3,
         expect_win=True,
+        min_largest_generated=3,
     ),
     SpymasterCase(
         name="race_last_card",
@@ -326,6 +329,101 @@ SPYMASTER_CASES: tuple[SpymasterCase, ...] = (
         candidates=(("STRIPES", ("TIGER",)), ("FELINES", ("LION", "TIGER"))),
         min_number=2,
         expect_clue="FELINES",
+    ),
+    # Regressions from the first race-aware live match.
+    SpymasterCase(
+        name="live_motion_keeps_number",
+        purpose="ours=8 theirs=6: MOTION 3 must stay MOTION 3 through verification.",
+        board=_race_board(
+            ours=("DANCE", "SWING", "WAVE", "LETTUCE", "PIANO", "KNIGHT", "GLACIER", "LADDER"),
+            theirs=("BANK", "ROBOT", "HOTEL", "CHAIR", "NURSE", "CHEESE"),
+            neutral=("WALL", "SHOE", "CARPET", "TRUCK", "POLICE", "PEN", "CLOUD"),
+            assassin="SKULL",
+        ),
+        candidates=(
+            ("MOTION", ("DANCE", "SWING", "WAVE")),
+            ("RHYTHM", ("DANCE", "SWING")),
+            ("SALAD", ("LETTUCE",)),
+        ),
+    ),
+    SpymasterCase(
+        name="live_ride_keeps_number",
+        purpose="ours=6 theirs=6: RIDE 2 is its own action and is never mutated to RIDE 1.",
+        board=_race_board(
+            ours=("HORSE", "BICYCLE", "TOOTH", "COMPASS", "SPIDER", "LADDER"),
+            theirs=("BANK", "ROBOT", "HOTEL", "CHAIR", "NURSE", "CHEESE"),
+            neutral=("WALL", "SHOE", "CARPET", "POLICE", "PEN", "CLOUD", "GLASS"),
+            assassin="SKULL",
+        ),
+        candidates=(("RIDE", ("HORSE", "BICYCLE")), ("PEDAL", ("BICYCLE",))),
+    ),
+    SpymasterCase(
+        name="critical_four_generated",
+        purpose="ours=4 theirs=1: four instruments; the generator must try 3-4 word plans.",
+        board=_race_board(
+            ours=("GUITAR", "DRUM", "PIANO", "VIOLIN"),
+            theirs=("OCEAN",),
+            neutral=("WALL", "SHOE", "CARPET", "TRUCK", "POLICE", "PEN", "CLOUD"),
+            assassin="SKULL",
+        ),
+        min_number=3,
+        min_multi_generated=2,
+        min_largest_generated=3,
+        expect_win=True,
+    ),
+    SpymasterCase(
+        name="critical_four_given",
+        purpose="ours=4 theirs=1: safe 1, good 2, riskier 4 (JAGUAR is a neutral cat).",
+        board=_race_board(
+            ours=("LION", "TIGER", "LEOPARD", "CHEETAH"),
+            theirs=("OCEAN",),
+            neutral=("JAGUAR", "WALL", "SHOE", "CARPET", "TRUCK", "POLICE", "PEN"),
+            assassin="SKULL",
+        ),
+        candidates=(
+            ("STRIPES", ("TIGER",)),
+            ("SAVANNA", ("LION", "CHEETAH")),
+            ("FELINES", ("LION", "TIGER", "LEOPARD", "CHEETAH")),
+        ),
+        min_number=2,
+    ),
+    SpymasterCase(
+        name="early_unsafe_four",
+        purpose="ours=8 theirs=8: FRUIT 4 also fits ORANGE, LEMON, CHERRY; coverage is not enough.",
+        board=_race_board(
+            ours=("APPLE", "BANANA", "GRAPE", "PEAR", "TELESCOPE", "PILLOW", "HELMET", "JACKET"),
+            theirs=(
+                "ORANGE",
+                "LEMON",
+                "CHERRY",
+                "MICROSCOPE",
+                "BLANKET",
+                "DESERT",
+                "COAT",
+                "PASSPORT",
+            ),
+            neutral=("SUGAR", "LENS", "SHEET", "STATUE", "SAND", "GLOVE", "TOAST"),
+            assassin="MONKEY",
+        ),
+        candidates=(
+            ("FRUIT", ("APPLE", "BANANA", "GRAPE", "PEAR")),
+            ("ASTRONOMY", ("TELESCOPE",)),
+            ("VINEYARD", ("GRAPE",)),
+        ),
+        reject_clue="FRUIT",
+        avoid=frozenset({"ORANGE", "LEMON", "CHERRY"}),
+    ),
+    SpymasterCase(
+        name="behind_generated_multi",
+        purpose="ours=7 theirs=3: several natural pairs; generation must not collapse to 1s.",
+        board=_race_board(
+            ours=("COFFEE", "TEA", "PIANO", "GUITAR", "KNIGHT", "SWORD", "LADDER"),
+            theirs=("BANK", "ROBOT", "HOTEL"),
+            neutral=("WALL", "SHOE", "CARPET", "TRUCK", "POLICE", "PEN", "CLOUD"),
+            assassin="SKULL",
+        ),
+        min_number=2,
+        min_multi_generated=3,
     ),
 )
 

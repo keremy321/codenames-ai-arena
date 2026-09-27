@@ -13,7 +13,7 @@ from typing import Any
 
 from codenames_ai.agents.association import format_ranking
 from codenames_ai.agents.base import LLMCall
-from codenames_ai.agents.clue_scoring import Side, side_of
+from codenames_ai.agents.clue_scoring import WIN_TIE, Side, best_by_size, side_of
 from codenames_ai.agents.operative import OperativeAgent
 from codenames_ai.agents.spymaster import Candidate, SpymasterAgent
 from codenames_ai.domain.enums import CardColor, Team
@@ -81,6 +81,8 @@ async def run_spymaster_case(case: SpymasterCase, llm: OllamaClient) -> CaseResu
     labels = _labels(cards, case.team)
     spymaster = SpymasterAgent(case.team, llm)
     spymaster.memory = list(case.memory)
+    # A remembered clue was given earlier, so it is also a used clue (as in a real game).
+    spymaster.used_clues = {m.clue.casefold() for m in case.memory}
     given = (
         [Candidate(clue, tuple(targets), "given") for clue, targets in case.candidates]
         if case.candidates is not None
@@ -111,23 +113,48 @@ async def run_spymaster_case(case: SpymasterCase, llm: OllamaClient) -> CaseResu
     lines.append(f"race: {trace.race.describe()}")
     for clue, problem in trace.rejected:
         lines.append(f"  dropped {clue!r}: {problem}")
-    for word, kinds in trace.associations.items():
-        lines.append(f"  assoc {word}: specific={kinds['specific']} broad={kinds['broad']}")
-    sources = {c.clue: c.source for c in trace.candidates}
-    screened = {a.clue: a for a in trace.screened}
-    for a in sorted(trace.assessments, key=lambda a: -a.win_probability):
-        mark = "*" if a is chosen else " "
-        verdict = "ok" if a.acceptable else ("VETO" if a.vetoed else "no")
-        lines.append(
-            f" {mark}{a.clue:>14} {a.number} {verdict:4} {a.metrics()} "
-            f"intended={list(a.intended)} ({sources.get(a.clue, '')})"
+    for word, kinds in trace.words.items():
+        lines.append(f"  assoc {word}: themes={kinds['themes']} specific={kinds['specific']}")
+    sizes = trace.generated_sizes
+    lines.append(
+        "generated: "
+        + " ".join(f"n{n}={k}" for n, k in sizes.items())
+        + (
+            f"  (focused regeneration: {trace.focused_regeneration})"
+            if trace.focused_regeneration
+            else ""
         )
-        if a.verified and a.clue in screened:
-            lines.append(f"      screen: {format_ranking(screened[a.clue].ranking, labels)}")
+    )
+    by_clue: dict[str, list] = {}
+    for a in trace.assessments:
+        by_clue.setdefault(a.clue, []).append(a)
+    screened_ranking = {a.clue: a.ranking for a in trace.screened}
+    order = sorted(by_clue, key=lambda c: -max(a.win_probability for a in by_clue[c]))
+    candidates = {c.clue: c for c in trace.candidates}
+    for clue_word in order:
+        actions = by_clue[clue_word]
+        cand = candidates.get(clue_word)
+        verified = actions[0].verified
         lines.append(
-            f"      {'verify' if a.verified else 'screen'}: {format_ranking(a.ranking, labels)}"
+            f"  {clue_word} intended={list(cand.targets) if cand else '?'} "
+            f"({cand.source if cand else ''}{': ' + cand.connection if cand and cand.connection else ''})"
         )
-        lines.append(f"      {a.reason}")
+        lines.append(f"      screen: {format_ranking(screened_ranking.get(clue_word, ()), labels)}")
+        if verified:
+            lines.append(f"      VERIFY: {format_ranking(actions[0].ranking, labels)}")
+        for a in sorted(actions, key=lambda a: a.number):
+            mark = "*" if a is chosen else " "
+            verdict = "ok" if a.acceptable else ("VETO" if a.vetoed else "no")
+            lines.append(f"     {mark}{a.clue} {a.number} {verdict:4} {a.metrics()} | {a.reason}")
+    best = best_by_size(trace.assessments)
+    lines.append(
+        "best by size: "
+        + "; ".join(
+            f"n{n} {a.clue} {a.number} win={a.win_probability:.3f}"
+            + ("" if a.verified else " (screened)")
+            for n, a in best.items()
+        )
+    )
     lines.append(
         f"selected: {decision.word} {decision.number}; expected hits {list(chosen.hits)}"
         + (f"  [{trace.note}]" if trace.note else "")
@@ -216,6 +243,36 @@ async def run_spymaster_case(case: SpymasterCase, llm: OllamaClient) -> CaseResu
         result.checks["operative follows verified plan"] = [w for w, _ in guesses][
             : len(planned)
         ] == planned[: len(guesses)] and bool(guesses)
+    # Candidate identity: verification re-scores the same (clue, number) actions only.
+    screened_actions: dict[str, set[int]] = {}
+    for a in trace.screened:
+        screened_actions.setdefault(a.clue, set()).add(a.number)
+    verified_actions: dict[str, set[int]] = {}
+    for a in trace.verified:
+        verified_actions.setdefault(a.clue, set()).add(a.number)
+    result.checks["verification preserved every (clue, number)"] = all(
+        numbers == screened_actions.get(clue_word)
+        for clue_word, numbers in verified_actions.items()
+    )
+    result.checks["selected action verified"] = chosen.verified
+    top = max(
+        (a.win_probability for a in trace.assessments if a.verified and a.acceptable), default=0
+    )
+    result.checks["selected action has the best verified win (within tie)"] = (
+        not chosen.acceptable or chosen.win_probability >= top - WIN_TIE - 1e-9
+    )
+    if case.min_multi_generated and case.candidates is None:
+        multi = sum(k for n, k in trace.generated_sizes.items() if n >= 2)
+        result.checks[f"generated >= {case.min_multi_generated} multi-word plans"] = (
+            multi >= case.min_multi_generated
+        )
+    if case.min_largest_generated and case.candidates is None:
+        largest = max((n for n, k in trace.generated_sizes.items() if k), default=0)
+        result.checks[f"attempted a {case.min_largest_generated}+-word plan"] = (
+            largest >= case.min_largest_generated
+        )
+    if case.reject_clue is not None:
+        result.checks[f"does not select {case.reject_clue}"] = decision.word != case.reject_clue
     if case.expect_clue is not None:
         result.checks[f"selects {case.expect_clue}"] = decision.word == case.expect_clue
     if case.expect_win:
@@ -251,6 +308,11 @@ async def run_spymaster_case(case: SpymasterCase, llm: OllamaClient) -> CaseResu
         "won": won,
         "verified": chosen.verified,
         "exact_ranking_match": exact_match,
+        "generated_sizes": trace.generated_sizes,
+        "focused_regeneration": trace.focused_regeneration,
+        "best_by_size": {
+            n: [a.clue, a.number, round(a.win_probability, 4), a.verified] for n, a in best.items()
+        },
     }
     return result
 

@@ -17,14 +17,14 @@ class SchemaFakeLLM:
     async def chat_json(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(kwargs)
         props = kwargs["schema"]["properties"]
-        if "associations" in props:
-            friendly = props["candidates"]["items"]["properties"]["targets"]["items"]["enum"]
+        if "words" in props or "groups" in props:
+            friendly = list(props["words"]["properties"]) if "words" in props else []
             return {
-                "associations": {
-                    w: {"specific": [f"idea{chr(97 + i)}"], "broad": []}
+                "words": {
+                    w: {"themes": [], "specific": [f"idea{chr(97 + i)}"]}
                     for i, w in enumerate(friendly)
                 },
-                "candidates": [],
+                "groups": [],
             }
         items = props["rankings"]["items"]["properties"]
         words = items["strong"]["items"]["enum"]

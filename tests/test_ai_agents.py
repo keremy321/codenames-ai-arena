@@ -47,7 +47,7 @@ class RoutedLLM:
 
     def __init__(
         self,
-        generate: dict | Exception,
+        generate: dict | Exception | list[dict],
         screen: dict[str, Ranking] | Exception,
         verify: dict[str, Ranking] | None = None,
     ) -> None:
@@ -62,7 +62,7 @@ class RoutedLLM:
         self.calls.append(kwargs)
         kind = _kind(kwargs)
         if kind == "generate":
-            answer = self.generate
+            answer = self.generate.pop(0) if isinstance(self.generate, list) else self.generate
         else:
             clues = _clues(kwargs)
             if isinstance(self.screen, Exception) and kind == "screen":
@@ -79,7 +79,7 @@ class RoutedLLM:
 
 def _kind(call: dict) -> str:
     props = call["schema"]["properties"]
-    if "associations" in props:
+    if "words" in props or "groups" in props:
         return "generate"
     return "verify" if "best_guess" in props else "screen"
 
@@ -122,10 +122,12 @@ def spy_state(revealed: frozenset[int] = frozenset()) -> SpymasterGameState:
     )
 
 
-def plans(*items: tuple[str, list[str]], associations: dict | None = None) -> dict:
+def plans(*items: tuple[str, list[str]], words: dict | None = None) -> dict:
     return {
-        "associations": associations or {},
-        "candidates": [{"targets": targets, "clue": clue} for clue, targets in items],
+        "words": words or {},
+        "groups": [
+            {"targets": targets, "clue": clue, "connection": "test link"} for clue, targets in items
+        ],
     }
 
 
@@ -136,7 +138,7 @@ async def test_spymaster_calls_and_colour_blind_checks() -> None:
         payload = json.loads(request.content)
         requests.append(payload)
         props = payload["format"]["properties"]
-        if "associations" in props:
+        if "groups" in props:
             answer = plans(("cosmos", ["WORD0", "WORD1"]))
         else:
             answer = {
@@ -154,7 +156,7 @@ async def test_spymaster_calls_and_colour_blind_checks() -> None:
     assert set(clue.model_dump()) == {"word", "number"}
     assert len(requests) == 3
     generator, screen, verify = requests
-    targets = generator["format"]["properties"]["candidates"]["items"]["properties"]["targets"]
+    targets = generator["format"]["properties"]["groups"]["items"]["properties"]["targets"]
     assert targets["items"]["enum"] == [f"WORD{i}" for i in range(9) if i != 3]
     user = generator["messages"][1]["content"]
     assert "ASSASSIN (never hint at it): WORD24" in user
@@ -230,28 +232,54 @@ async def test_friendly_target_does_not_save_clue_that_points_elsewhere() -> Non
 async def test_assassin_match_vetoes_even_large_coverage() -> None:
     llm = RoutedLLM(
         plans(("BIG", ["WORD0", "WORD1", "WORD2"]), ("SMALL", ["WORD3"])),
-        {"BIG": ([0, 1, 2], [24]), "SMALL": ([3], [])},
+        {"BIG": ([0, 1, 2, 24], []), "SMALL": ([3], [])},
     )
     agent = SpymasterAgent(Team.BLUE, llm)
     assert (await agent.choose_clue(spy_state())).word == "SMALL"
-    assert next(a for a in agent.last_trace.assessments if a.clue == "BIG").vetoed
+    big = [a for a in agent.last_trace.assessments if a.clue == "BIG"]
+    assert big and all(a.vetoed for a in big)
 
 
 async def test_assassin_in_verified_ranking_vetoes_screened_winner() -> None:
     llm = RoutedLLM(
         plans(("BIG", ["WORD0", "WORD1"]), ("SMALL", ["WORD3"])),
         {"BIG": ([0, 1], []), "SMALL": ([3], [])},
-        verify={"BIG": ([0, 1], [24])},
+        verify={"BIG": ([0, 1, 24], [])},
     )
     assert (await SpymasterAgent(Team.BLUE, llm).choose_clue(spy_state())).word == "SMALL"
 
 
-async def test_number_never_exceeds_likely_plan() -> None:
-    llm = RoutedLLM(plans(("PARTIAL", ["WORD0", "WORD1", "WORD2"])), {"PARTIAL": ([0, 1], [2, 17])})
+async def test_each_number_is_its_own_action_and_verification_keeps_it() -> None:
+    # Live bug: MOTION 3 screened well, verification re-derived it as MOTION 1, and a
+    # weaker single won. Now every (clue, number) is scored and verified as itself.
+    llm = RoutedLLM(
+        plans(("MOTION", ["WORD0", "WORD1", "WORD2"]), ("SALAD", ["WORD3"])),
+        {"MOTION": ([0, 1, 2], []), "SALAD": ([3], [])},
+        verify={"MOTION": ([0], [9])},  # the operative's own reading is much weaker
+    )
     agent = SpymasterAgent(Team.BLUE, llm)
-    assert (await agent.choose_clue(spy_state())).number == 2
-    assert agent.memory[-1].expected == ("WORD0", "WORD1")
-    assert agent.memory[-1].intended == ("WORD0", "WORD1", "WORD2")
+    await agent.choose_clue(spy_state())
+    trace = agent.last_trace
+    screened = {a.action for a in trace.screened if a.clue == "MOTION"}
+    verified = {a.action for a in trace.verified if a.clue == "MOTION"}
+    assert screened == verified == {("MOTION", 1), ("MOTION", 2), ("MOTION", 3)}
+    motion3 = next(a for a in trace.assessments if a.action == ("MOTION", 3))
+    assert motion3.verified and motion3.number == 3
+    # The choice is simply the best verified action, whatever its size.
+    best = max(a.win_probability for a in trace.assessments if a.verified and a.acceptable)
+    assert trace.selected.win_probability == pytest.approx(best)
+
+
+async def test_ride_two_is_never_mutated_to_ride_one() -> None:
+    llm = RoutedLLM(
+        plans(("RIDE", ["WORD0", "WORD1"])),
+        {"RIDE": ([0, 1], [])},
+        verify={"RIDE": ([0, 1, 17], [])},
+    )
+    agent = SpymasterAgent(Team.BLUE, llm)
+    await agent.choose_clue(spy_state())
+    for a in agent.last_trace.verified:
+        assert a.action in {x.action for x in agent.last_trace.screened}
 
 
 RED_ON_ONE = frozenset(range(9, 16))  # RED has only WORD16 left
@@ -261,7 +289,7 @@ BLUE_ON_TWO = frozenset(range(2, 9))  # BLUE has only WORD0, WORD1 left
 async def test_match_point_prefers_finishing_clue_over_perfect_single() -> None:
     # ours=2, theirs=1: a certain single card leaves RED a very likely winning turn.
     llm = RoutedLLM(
-        plans(("PAIR", ["WORD0", "WORD1"]), associations={}),
+        plans(("PAIR", ["WORD0", "WORD1"])),
         {"PAIR": ([0, 1], [17]), "SOLO": ([0], [])},
     )
     agent = SpymasterAgent(Team.BLUE, llm)
@@ -271,7 +299,8 @@ async def test_match_point_prefers_finishing_clue_over_perfect_single() -> None:
     trace = agent.last_trace
     assert trace.race.pressure == "critical"
     assert trace.selected.finish_chance > 0.9
-    assert "opponent can likely finish next turn" in trace.explanation
+    assert "85% estimated finish-next chance" in trace.explanation
+    assert "best 1-card SOLO" in trace.explanation
 
 
 async def test_when_ahead_a_safe_single_beats_a_risky_triple() -> None:
@@ -295,33 +324,33 @@ async def test_generator_receives_race_guidance() -> None:
     await SpymasterAgent(Team.BLUE, llm).choose_clue(spy_state(RED_ON_ONE | BLUE_ON_TWO))
     user = llm.calls[0]["user"]
     assert "you have 2 words left, the opponent has 1" in user
-    assert "will probably win on its next turn" in user
-    assert "connecting all 2 of your remaining words would win" in user
+    assert "very likely to win on its next turn" in user
+    assert "Search order: a credible 2-word clue" in user
 
 
 async def test_last_card_generation_asks_only_for_associations() -> None:
     llm = RoutedLLM(
-        {"associations": {"WORD0": {"specific": ["lone"], "broad": []}}},
+        {"words": {"WORD0": {"themes": [], "specific": ["lone"]}}},
         {"LONE": ([0], [])},
     )
     clue = await SpymasterAgent(Team.BLUE, llm).choose_clue(spy_state(frozenset(range(1, 9))))
     assert (clue.word, clue.number) == ("LONE", 1)
-    assert "candidates" not in llm.calls[0]["schema"]["properties"]
+    assert "groups" not in llm.calls[0]["schema"]["properties"]
 
 
 async def test_reserve_single_target_round_uses_screen_not_generation() -> None:
     associations = {
-        f"WORD{i}": {"specific": [f"pick{c}{v}" for v in "abc"], "broad": []}
+        f"WORD{i}": {"themes": [], "specific": [f"pick{c}{v}" for v in "ab"]}
         for i, c in enumerate("klmnopqrs")
     }
     first_round = {}
-    llm = RoutedLLM(plans(associations=associations), {})
+    llm = RoutedLLM(plans(words=associations), {})
 
     async def chat_json(**kwargs: object) -> dict:
         llm.calls.append(kwargs)
         kind = _kind(kwargs)
         if kind == "generate":
-            return plans(associations=associations)
+            return plans(words=associations)
         clues = _clues(kwargs)
         if not first_round:  # every first-round clue points at an enemy word
             first_round["clues"] = clues
@@ -354,7 +383,7 @@ async def test_least_bad_clue_when_nothing_is_acceptable() -> None:
 
 
 async def test_all_vetoed_raises_instead_of_risking_assassin() -> None:
-    llm = RoutedLLM(plans(("DOOM", ["WORD0"])), {"DOOM": ([0], [24])})
+    llm = RoutedLLM(plans(("DOOM", ["WORD0"])), {"DOOM": ([0, 24], [])})
     with pytest.raises(ValueError, match="No safe clue after 2 Ollama calls"):
         await SpymasterAgent(Team.BLUE, llm).choose_clue(spy_state())
 
@@ -429,6 +458,8 @@ async def test_spymaster_never_repeats_its_own_clue() -> None:
         ("ice-cold", False),
         ("B4", True),
         ("frost", False),
+        ("international", False),  # 13 letters: still allowed
+        ("musicalinstrument", True),  # a glued compound
     ],
 )
 def test_clue_rules(clue: str, problem: bool) -> None:
@@ -656,7 +687,11 @@ async def test_underrated_multi_word_clue_is_verified_within_margin() -> None:
     clue = await agent.choose_clue(spy_state())
     assert (clue.word, clue.number) == ("PAIR", 2)
     assert llm.kinds == ["generate", "screen", "verify", "verify"]
-    assert [v.clue for v in agent.last_trace.verified] == ["SOLO", "PAIR"]
+    assert [v.action for v in agent.last_trace.verified] == [
+        ("SOLO", 1),
+        ("PAIR", 1),
+        ("PAIR", 2),
+    ]
 
 
 async def test_selected_clue_is_always_verified() -> None:
@@ -672,3 +707,117 @@ async def test_selected_clue_is_always_verified() -> None:
     clue = await agent.choose_clue(spy_state())
     assert clue.word == "DFOUR" and agent.last_trace.selected.verified
     assert llm.kinds == ["generate", "screen"] + ["verify"] * 4
+
+
+BEHIND = frozenset(range(9, 14))  # RED has 3 left, BLUE 9: behind
+CRITICAL_FOUR = frozenset(range(4, 9)) | frozenset(range(9, 16))  # ours=4, theirs=1
+
+
+def singles_only() -> dict:
+    words = {
+        f"WORD{i}": {"themes": [], "specific": [f"solo{c}"]} for i, c in enumerate("klmnopqrs")
+    }
+    return {"words": words, "groups": []}
+
+
+async def test_generator_searches_groups_up_to_four_and_keeps_notes_private() -> None:
+    llm = RoutedLLM(
+        plans(("QUAD", ["WORD0", "WORD1", "WORD2", "WORD3"])),
+        {"QUAD": ([0, 1, 2, 3], [])},
+    )
+    agent = SpymasterAgent(Team.BLUE, llm)
+    clue = await agent.choose_clue(spy_state())
+    group = llm.calls[0]["schema"]["properties"]["groups"]["items"]["properties"]["targets"]
+    assert (group["minItems"], group["maxItems"]) == (2, 4)
+    assert "groups of four" in llm.calls[0]["system"]
+    assert clue.number <= 4 and agent.last_trace.generated_sizes[4] == 1
+    for call in llm.calls[1:]:
+        assert "test link" not in json.dumps(call)  # private connection notes
+
+
+async def test_first_screen_is_mostly_multi_word() -> None:
+    words = {
+        f"WORD{i}": {"themes": [], "specific": [f"solo{c}", f"alt{c}"]}
+        for i, c in enumerate("klmnopqrs")
+    }
+    groups = [(f"pair{c}", [f"WORD{i}", f"WORD{i + 1}"]) for i, c in enumerate("abcdefg")]
+    llm = RoutedLLM({**plans(*groups), "words": words}, {})
+    agent = SpymasterAgent(Team.BLUE, llm)
+    with pytest.raises(ValueError):  # the fake ranks nothing; only the pool matters here
+        await agent.choose_clue(spy_state())
+    first_screen = _clues(llm.calls[1])
+    singles = [c for c in first_screen if c.startswith(("SOLO", "ALT"))]
+    assert len(first_screen) == POOL_SIZE and len(singles) == 3
+    assert agent.last_trace.generated_sizes[1] == 18 and agent.last_trace.generated_sizes[2] == 7
+
+
+async def test_focused_regeneration_runs_once_when_behind_without_groups() -> None:
+    llm = RoutedLLM(
+        [singles_only(), plans(("PAIR", ["WORD0", "WORD1"]))],
+        {"PAIR": ([0, 1], []), "SOLOK": ([0], [])},
+    )
+    agent = SpymasterAgent(Team.BLUE, llm)
+    clue = await agent.choose_clue(spy_state(BEHIND))
+    assert agent.last_trace.race.pressure == "behind"
+    assert llm.kinds.count("generate") == 2
+    assert "Give ONLY groups" in llm.calls[1]["user"]
+    assert "multi-word plan" in agent.last_trace.focused_regeneration
+    assert (clue.word, clue.number) == ("PAIR", 2)
+
+
+async def test_focused_regeneration_never_loops() -> None:
+    llm = RoutedLLM([singles_only(), {"groups": []}], {"SOLOK": ([0], [])})
+    agent = SpymasterAgent(Team.BLUE, llm)
+    await agent.choose_clue(spy_state(BEHIND))
+    assert llm.kinds.count("generate") == 2
+
+
+async def test_no_focused_regeneration_in_an_even_race() -> None:
+    llm = RoutedLLM(singles_only(), {"SOLOK": ([0], [])})
+    agent = SpymasterAgent(Team.BLUE, llm)
+    await agent.choose_clue(spy_state())
+    assert llm.kinds.count("generate") == 1 and not agent.last_trace.focused_regeneration
+
+
+async def test_critical_endgame_searches_all_in_first() -> None:
+    llm = RoutedLLM(
+        [
+            plans(("DUO", ["WORD0", "WORD1"]), ("DUET", ["WORD2", "WORD3"])),
+            plans(("QUAD", ["WORD0", "WORD1", "WORD2", "WORD3"])),
+        ],
+        {"DUO": ([0, 1], []), "DUET": ([2, 3], []), "QUAD": ([0, 1, 2, 3], [17])},
+    )
+    agent = SpymasterAgent(Team.BLUE, llm)
+    clue = await agent.choose_clue(spy_state(CRITICAL_FOUR))
+    first = llm.calls[0]["user"]
+    assert "Search order: a credible 4-word clue, then a credible 3-word clue" in first
+    assert "without a 4-word attempt" in agent.last_trace.focused_regeneration
+    assert (clue.word, clue.number) == ("QUAD", 4)
+    assert agent.last_trace.selected.finish_chance > 0.5
+
+
+async def test_generator_grammar_forces_single_words() -> None:
+    llm = RoutedLLM(plans(("ORBIT", ["WORD0", "WORD1"])), {"ORBIT": ([0, 1], [])})
+    await SpymasterAgent(Team.BLUE, llm).choose_clue(spy_state())
+    props = llm.calls[0]["schema"]["properties"]
+    pattern = props["groups"]["items"]["properties"]["clue"]["pattern"]
+    assert (
+        pattern
+        == props["words"]["properties"]["WORD0"]["properties"]["specific"]["items"]["pattern"]
+    )
+    import re
+
+    assert re.fullmatch(pattern, "Magma") and re.fullmatch(pattern, "ice-cold")
+    for bad in ("Erupting mountain", "EruptingMountain", "B4", ""):
+        assert not re.fullmatch(pattern, bad)
+
+
+async def test_unusable_first_generation_gets_one_retry() -> None:
+    phrases = {"words": {"WORD0": {"themes": [], "specific": ["two words"]}}, "groups": []}
+    llm = RoutedLLM([phrases, plans(("LONE", ["WORD0"]))], {"LONE": ([0], [])})
+    agent = SpymasterAgent(Team.BLUE, llm)
+    clue = await agent.choose_clue(spy_state(frozenset(range(1, 9))))
+    assert clue.word == "LONE"
+    assert llm.kinds.count("generate") == 2
+    assert "not usable single words" in llm.calls[1]["user"]
+    assert "words" in llm.calls[1]["schema"]["properties"]
