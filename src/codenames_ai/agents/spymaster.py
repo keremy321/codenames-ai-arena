@@ -1,7 +1,7 @@
 """Spymaster: search target groups, keep each (clue, number) action intact, pick the
 action with the highest match win probability.
 
-Per clue the normal cost is 3-6 qwen3 calls:
+Per clue the normal cost is 3-4 qwen3 calls (5 with a focused regeneration):
 1. generate: per friendly word two themes (categories, functions, properties) and two
    specific single-word ideas, then 4-8 target GROUPS (2 up to min(4, our cards) words)
    with a clue and a short private connection. The race situation sets the search
@@ -11,21 +11,23 @@ Per clue the normal cost is 3-6 qwen3 calls:
    when behind/critical, or a critical endgame has no all-in attempt.
 3. screen: one batched colour-blind ranking; multi-word clues fill most of the pool,
    single-word fallbacks the rest.
-4. verify (1-3 short calls, +2 at most for the final choice): the operative's exact
-   single-clue request. It re-scores every action of that clue with the SAME numbers.
+4. verify (1-2 short calls; up to 2 more only if no verified action is acceptable): the
+   operative's exact single-clue request for a finalist clue WORD, re-scoring every
+   (clue, number) action of that word in the same request, numbers unchanged.
 Every action is scored locally (clue_scoring + race); no call is spent on strategy.
 Nothing bypasses the colour-blind check, and there are no open-ended retries.
 """
 
 import logging
 import re
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from codenames_ai.domain.enums import CardColor, Role, Team
 from codenames_ai.domain.models import ClueDecision, SpymasterGameState
-from codenames_ai.llm.ollama import OllamaClient, OllamaResponseError
+from codenames_ai.llm.base import LLMClient, LLMResponseError
 
 from .association import (
     RANKER_TEMPERATURE,
@@ -48,6 +50,7 @@ from .clue_scoring import (
     assess_actions,
     best_by_size,
     explain_choice,
+    prune_dominated,
     select_clue,
     side_of,
 )
@@ -55,14 +58,18 @@ from .race import RaceState
 
 logger = logging.getLogger(__name__)
 
-POOL_SIZE = 10  # clue words per screening call
-POOL_SINGLES = 3  # single-word fallbacks in the first screen when multi-word ideas exist
-MAX_VERIFY = 3
+POOL_SIZE = 8  # clue words per screening call (~25 output tokens each)
+POOL_SINGLES = 2  # single-word fallbacks in the first screen when multi-word ideas exist
+# Clue WORDS verified normally. One request re-scores every number of that word.
+MAX_VERIFY = 2
 # Batched screening misjudges multi-word clues most (it over- or under-lists
 # competitors), so a finalist whose screened win probability is within this margin of
 # the best verified action is verified too, up to MAX_VERIFY. Each check is ~1-2 s.
 VERIFY_MARGIN = 0.10
-FINAL_CHECKS = 2
+RESCUE_CHECKS = 2  # only when no verified action is acceptable
+# qwen3 sometimes pretty-prints constrained JSON, nearly doubling generation time
+# (665 vs ~400 tokens measured); asking for one line avoided it in every sample.
+COMPACT_JSON = " Reply with compact single-line JSON: no line breaks or indentation."
 THEMES_PER_WORD = 2
 SPECIFIC_PER_WORD = 2
 GENERATOR_TEMPERATURE = 0.4
@@ -175,6 +182,10 @@ class SpymasterTrace:
     generated_sizes: dict[int, int] = field(default_factory=dict)
     focused_regeneration: str = ""  # why the one extra generation ran, if it did
     screened: list[ClueAssessment] = field(default_factory=list)
+    expanded_sizes: dict[int, int] = field(default_factory=dict)  # after pruning
+    finalists: list[tuple[str, list[int]]] = field(default_factory=list)
+    verified_words: list[str] = field(default_factory=list)
+    seconds: float = 0.0
     verified: list[ClueAssessment] = field(default_factory=list)
     assessments: list[ClueAssessment] = field(default_factory=list)  # final estimates
     selected: ClueAssessment | None = None
@@ -198,6 +209,10 @@ class _Board:
     sides: Mapping[str, Side]
 
 
+def _sizes(counts: Mapping[int, int]) -> str:
+    return " ".join(f"n{n}={k}" for n, k in counts.items())
+
+
 def size_counts(candidates: Sequence[Candidate], max_number: int) -> dict[int, int]:
     counts = {n: 0 for n in range(1, max_number + 1)}
     for c in candidates:
@@ -207,7 +222,7 @@ def size_counts(candidates: Sequence[Candidate], max_number: int) -> dict[int, i
 
 class SpymasterAgent(Agent):
     def __init__(
-        self, team: Team, llm: OllamaClient, *, utility: ClueUtility = DEFAULT_UTILITY
+        self, team: Team, llm: LLMClient, *, utility: ClueUtility = DEFAULT_UTILITY
     ) -> None:
         super().__init__(team, Role.SPYMASTER, llm)
         self.utility = utility
@@ -268,6 +283,7 @@ class SpymasterAgent(Agent):
         self, state: SpymasterGameState, *, candidates: Sequence[Candidate] | None = None
     ) -> ClueDecision:
         """Pick a clue. ``candidates`` replaces generation (offline evaluation only)."""
+        started = time.perf_counter()
         board = self._board(state)
         race = RaceState.of(len(board.friendly), len(board.enemy), self.utility.race)
         trace = SpymasterTrace(self.team, race)
@@ -279,11 +295,7 @@ class SpymasterAgent(Agent):
             given = [(c.clue, c.targets, "given", c.connection) for c in candidates]
             pool = self._prepare(board, trace, given)
         trace.generated_sizes = size_counts(trace.candidates, self.utility.max_number)
-        logger.info(
-            "[%s] generated: %s",
-            self.team,
-            " ".join(f"n{n}={k}" for n, k in trace.generated_sizes.items()),
-        )
+        logger.info("[%s] raw plans: %s", self.team, _sizes(trace.generated_sizes))
         first, reserve = self._split_pool(pool)
         screened = await self._screen(board, race, trace, first)
         if not any(a.acceptable for a in screened) and reserve:
@@ -291,12 +303,14 @@ class SpymasterAgent(Agent):
             logger.info("[%s] no acceptable action; screening reserve clues", self.team)
             screened += await self._screen(board, race, trace, reserve[:POOL_SIZE])
         trace.screened = screened
-        trace.assessments = await self._verify(board, race, trace, screened)
-        choice = select_clue(trace.assessments)
+        trace.assessments = prune_dominated(await self._verify(board, race, trace, screened))
+        # Submit a verified action whenever one is acceptable.
+        verified_ok = [a for a in trace.assessments if a.verified and a.acceptable]
+        choice = select_clue(verified_ok or trace.assessments)
         if choice is None:
             trace.note = "every candidate was invalid, unassessed, or vetoed"
             logger.error("[%s] no safe clue: %s", self.team, describe_calls(trace.calls))
-            raise ValueError(f"No safe clue after {len(trace.calls)} Ollama calls: {trace.note}")
+            raise ValueError(f"No safe clue after {len(trace.calls)} LLM calls: {trace.note}")
         if not choice.acceptable:
             trace.note = "no acceptable action; using the least bad non-vetoed candidate"
             logger.warning("[%s] %s", self.team, trace.note)
@@ -314,6 +328,15 @@ class SpymasterAgent(Agent):
                 for n, a in sizes.items()
             )
             or "-",
+        )
+        trace.seconds = time.perf_counter() - started
+        logger.info(
+            "[%s] verified clue words: %d (%s); llm calls: %d; total: %.1fs",
+            self.team,
+            len(trace.verified_words),
+            ", ".join(trace.verified_words) or "-",
+            len(trace.calls),
+            trace.seconds,
         )
         logger.info(
             "[%s] selected %s %d (%s; %s); expected %s; intended %s; reason: %s; %s",
@@ -353,7 +376,7 @@ class SpymasterAgent(Agent):
             try:
                 reply = await self._generate(board, race, trace, missed, focus=False)
                 break
-            except OllamaResponseError as exc:
+            except LLMResponseError as exc:
                 logger.warning("[%s] generation attempt %d failed: %s", self.team, attempt + 1, exc)
         if reply is None:
             return []
@@ -371,7 +394,7 @@ class SpymasterAgent(Agent):
                 extra = await self._generate(board, race, trace, missed, focus=True)
                 ordered += self._plans(board, trace, extra, "focus")
                 pool = self._prepare(board, trace, ordered)
-            except OllamaResponseError as exc:
+            except LLMResponseError as exc:
                 logger.warning("[%s] focused regeneration failed: %s", self.team, exc)
         return pool
 
@@ -517,7 +540,7 @@ class SpymasterAgent(Agent):
             properties["groups"] = {
                 "type": "array",
                 "minItems": 3 if focus else 4,
-                "maxItems": 8,
+                "maxItems": 6,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -561,7 +584,7 @@ class SpymasterAgent(Agent):
             )
         system += (
             " Avoid any clue that also fits an opponent word, a neutral word, or above all "
-            "the assassin."
+            "the assassin." + COMPACT_JSON
         )
         lines = [
             f"YOUR words: {', '.join(board.friendly)}",
@@ -658,37 +681,52 @@ class SpymasterAgent(Agent):
         trace: SpymasterTrace,
         screened: Sequence[ClueAssessment],
     ) -> list[ClueAssessment]:
-        """Re-rank the most promising clues with the operative's exact request.
+        """Re-rank the most promising clue WORDS with the operative's exact request.
 
-        The verified ranking replaces the screened one for EVERY action of that clue,
-        with exactly the same numbers: (MOTION, 3) stays (MOTION, 3), better or worse.
+        Finalists are ranked locally from the screened actions (dominated numbers pruned).
+        One request per finalist word re-scores EVERY number of that word, keeping each
+        (clue, number) exactly: (MOTION, 3) stays (MOTION, 3), better or worse. The second
+        word is verified only if its screened estimate is within VERIFY_MARGIN of the best
+        verified action. Only if no verified action is acceptable at all are up to
+        RESCUE_CHECKS more clues verified, so a screened-only estimate is not submitted.
         """
         final = {a.action: a for a in screened}
         verified_clues: set[str] = set()
-
-        def finalists() -> list[ClueAssessment]:
-            return sorted(
-                (a for a in final.values() if not a.vetoed and a.ranking and not a.verified),
-                key=lambda a: (a.acceptable, a.win_probability),
-                reverse=True,
-            )
-
-        for _ in range(MAX_VERIFY):
-            pending = finalists()
-            if not pending:
+        pruned = prune_dominated(screened)
+        trace.expanded_sizes = {
+            n: sum(1 for a in pruned if a.number == n)
+            for n in range(1, self.utility.max_number + 1)
+        }
+        words: dict[str, list[ClueAssessment]] = {}
+        for a in pruned:
+            if not a.vetoed and a.ranking:
+                words.setdefault(a.clue, []).append(a)
+        ranked = sorted(
+            words.items(),
+            key=lambda item: max((a.acceptable, a.win_probability) for a in item[1]),
+            reverse=True,
+        )
+        trace.finalists = [(clue, [a.number for a in acts]) for clue, acts in ranked[:MAX_VERIFY]]
+        logger.info(
+            "[%s] expanded actions: %s; finalists: %s",
+            self.team,
+            _sizes(trace.expanded_sizes),
+            ", ".join(f"{c}[{','.join(map(str, ns))}]" for c, ns in trace.finalists) or "-",
+        )
+        for index, (clue, acts) in enumerate(ranked[:MAX_VERIFY]):
+            if index:
+                best = select_clue([a for a in final.values() if a.verified and a.acceptable])
+                estimate = max(a.win_probability for a in acts)
+                if best is not None and estimate < best.win_probability - VERIFY_MARGIN:
+                    break
+            await self._verify_clue(board, race, trace, clue, final, verified_clues)
+        # Rare path: every verified finalist disappointed. Check the best remaining
+        # estimate (at most RESCUE_CHECKS more) rather than submit it unverified.
+        for _ in range(RESCUE_CHECKS):
+            if any(a.verified and a.acceptable for a in final.values()):
                 break
-            await self._verify_clue(board, race, trace, pending[0].clue, final, verified_clues)
-            best = select_clue([a for a in final.values() if a.verified and a.acceptable])
-            upcoming = finalists()
-            # Stop once no unverified action could plausibly beat the verified best.
-            if best is not None and (
-                not upcoming or upcoming[0].win_probability < best.win_probability - VERIFY_MARGIN
-            ):
-                break
-        # Never submit an action whose ranking was only screened.
-        for _ in range(FINAL_CHECKS):
             choice = select_clue(list(final.values()))
-            if choice is None or choice.verified or choice.clue in verified_clues:
+            if choice is None or choice.clue in verified_clues:
                 break
             await self._verify_clue(board, race, trace, choice.clue, final, verified_clues)
         return list(final.values())
@@ -703,11 +741,12 @@ class SpymasterAgent(Agent):
         verified_clues: set[str],
     ) -> None:
         verified_clues.add(clue)
+        trace.verified_words.append(clue)
         actions = [a for a in final.values() if a.clue == clue]
         request = single_clue_request(clue, board.unrevealed)
         try:
             reply = await timed_chat(self.llm, trace.calls, "verify", **request)
-        except OllamaResponseError as exc:
+        except LLMResponseError as exc:
             logger.warning("[%s] verifying %s failed: %s", self.team, clue, exc)
             return
         numbers = [a.number for a in actions]
@@ -747,7 +786,7 @@ class SpymasterAgent(Agent):
                 num_predict=60 + 60 * len(clues),
                 temperature=RANKER_TEMPERATURE,
             )
-        except OllamaResponseError as exc:
+        except LLMResponseError as exc:
             logger.warning("[%s] screening failed: %s", self.team, exc)
             return None
         return parse_rankings(reply, clues, board.unrevealed)

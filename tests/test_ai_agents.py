@@ -4,9 +4,11 @@ import httpx
 import pytest
 
 from codenames_ai.agents.association import RANKING_SYSTEM, single_clue_request
+from codenames_ai.agents.base import Agent
 from codenames_ai.agents.operative import OperativeAgent
 from codenames_ai.agents.spymaster import (
     MAX_VERIFY,
+    POOL_SINGLES,
     POOL_SIZE,
     Candidate,
     SpymasterAgent,
@@ -20,7 +22,10 @@ from codenames_ai.domain.models import (
     PublicGameState,
     SpymasterGameState,
 )
+from codenames_ai.llm.anthropic_client import AnthropicClient
+from codenames_ai.llm.base import LLMClient, LLMResponseError
 from codenames_ai.llm.ollama import OllamaClient, OllamaResponseError
+from codenames_ai.llm.openai_client import OpenAIClient
 
 
 class ScriptedLLM:
@@ -263,7 +268,7 @@ async def test_each_number_is_its_own_action_and_verification_keeps_it() -> None
     screened = {a.action for a in trace.screened if a.clue == "MOTION"}
     verified = {a.action for a in trace.verified if a.clue == "MOTION"}
     assert screened == verified == {("MOTION", 1), ("MOTION", 2), ("MOTION", 3)}
-    motion3 = next(a for a in trace.assessments if a.action == ("MOTION", 3))
+    motion3 = next(a for a in trace.verified if a.action == ("MOTION", 3))
     assert motion3.verified and motion3.number == 3
     # The choice is simply the best verified action, whatever its size.
     best = max(a.win_probability for a in trace.assessments if a.verified and a.acceptable)
@@ -384,7 +389,7 @@ async def test_least_bad_clue_when_nothing_is_acceptable() -> None:
 
 async def test_all_vetoed_raises_instead_of_risking_assassin() -> None:
     llm = RoutedLLM(plans(("DOOM", ["WORD0"])), {"DOOM": ([0, 24], [])})
-    with pytest.raises(ValueError, match="No safe clue after 2 Ollama calls"):
+    with pytest.raises(ValueError, match="No safe clue after 2 LLM calls"):
         await SpymasterAgent(Team.BLUE, llm).choose_clue(spy_state())
 
 
@@ -747,7 +752,7 @@ async def test_first_screen_is_mostly_multi_word() -> None:
         await agent.choose_clue(spy_state())
     first_screen = _clues(llm.calls[1])
     singles = [c for c in first_screen if c.startswith(("SOLO", "ALT"))]
-    assert len(first_screen) == POOL_SIZE and len(singles) == 3
+    assert len(first_screen) == POOL_SIZE and len(singles) == POOL_SINGLES
     assert agent.last_trace.generated_sizes[1] == 18 and agent.last_trace.generated_sizes[2] == 7
 
 
@@ -821,3 +826,110 @@ async def test_unusable_first_generation_gets_one_retry() -> None:
     assert llm.kinds.count("generate") == 2
     assert "not usable single words" in llm.calls[1]["user"]
     assert "words" in llm.calls[1]["schema"]["properties"]
+
+
+async def test_one_request_verifies_every_number_of_a_word() -> None:
+    llm = RoutedLLM(plans(("PLANT", ["WORD0", "WORD1", "WORD2"])), {"PLANT": ([0, 1, 2], [])})
+    agent = SpymasterAgent(Team.BLUE, llm)
+    await agent.choose_clue(spy_state())
+    assert llm.kinds == ["generate", "screen", "verify"]
+    assert {a.action for a in agent.last_trace.verified} == {
+        ("PLANT", 1),
+        ("PLANT", 2),
+        ("PLANT", 3),
+    }
+    assert agent.last_trace.verified_words == ["PLANT"]
+
+
+async def test_normal_turn_verifies_at_most_two_words_and_logs_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO")
+    names = ["PAIRA", "PAIRB", "PAIRC", "PAIRD", "PAIRE"]
+    llm = RoutedLLM(
+        plans(*[(n, [f"WORD{i}", f"WORD{i + 1}"]) for i, n in enumerate(names)]),
+        {n: ([i, i + 1], []) for i, n in enumerate(names)},
+    )
+    agent = SpymasterAgent(Team.BLUE, llm)
+    await agent.choose_clue(spy_state())
+    trace = agent.last_trace
+    assert llm.kinds.count("verify") <= MAX_VERIFY
+    assert len(trace.finalists) <= MAX_VERIFY and trace.finalists[0][1] == [1, 2]
+    assert trace.expanded_sizes[1] == 5 and trace.expanded_sizes[2] == 5
+    assert trace.seconds > 0
+    for line in ("raw plans: n1=0 n2=5", "expanded actions: n1=5 n2=5", "finalists: PAIRA[1,2]",
+                 "verified clue words:", "llm calls:", "total:"):  # fmt: skip
+        assert line in caplog.text
+
+
+async def test_generator_asks_for_compact_json() -> None:
+    llm = RoutedLLM(plans(("ORBIT", ["WORD0", "WORD1"])), {"ORBIT": ([0, 1], [])})
+    await SpymasterAgent(Team.BLUE, llm).choose_clue(spy_state())
+    assert "compact single-line JSON" in llm.calls[0]["system"]
+    # The ranking prompts stay byte-identical to the operative's: no extra instruction.
+    assert all("compact" not in call["system"] for call in llm.calls[1:])
+
+
+def test_agents_depend_on_the_shared_llm_interface() -> None:
+    import codenames_ai.agents.operative as operative_module
+    import codenames_ai.agents.spymaster as spymaster_module
+
+    assert Agent.__dataclass_fields__["llm"].type is LLMClient
+    for module in (operative_module, spymaster_module):
+        assert not hasattr(module, "OllamaClient")
+
+
+async def test_operative_retries_any_provider_response_error() -> None:
+    llm = ScriptedLLM(LLMResponseError("bad"), op_rank("SPACE", ["STAR"], best="STAR"))
+    choice = await OperativeAgent(Team.BLUE, llm).choose_guesses(public_state())
+    assert choice.indices == (1,) and len(llm.calls) == 2
+
+
+def _hosted(provider: str, answer: dict, requests: list[dict]) -> LLMClient:
+    import anthropic
+    import httpx2
+    import openai
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        requests.append(json.loads(request.content))
+        text = json.dumps(answer)
+        if provider == "openai":
+            message = {"role": "assistant", "content": text, "refusal": None}
+            return httpx2.Response(
+                200,
+                json={
+                    "id": "c",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "m",
+                    "choices": [{"index": 0, "finish_reason": "stop", "message": message}],
+                },
+            )
+        return httpx2.Response(
+            200,
+            json={
+                "id": "m",
+                "type": "message",
+                "role": "assistant",
+                "model": "m",
+                "content": [{"type": "text", "text": text}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+
+    http = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+    if provider == "openai":
+        return OpenAIClient("m", client=openai.AsyncOpenAI(api_key="k", http_client=http))
+    return AnthropicClient("m", client=anthropic.AsyncAnthropic(api_key="k", http_client=http))
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+async def test_operative_plays_on_hosted_providers_with_public_prompt(provider: str) -> None:
+    requests: list[dict] = []
+    llm = _hosted(provider, op_rank("SPACE", ["STAR", "MOON"], best="STAR"), requests)
+    choice = await OperativeAgent(Team.BLUE, llm).choose_guesses(public_state())
+    assert choice.indices == (1,) and choice.source_clue == "SPACE"
+    (sent,) = requests
+    assert "assassin" not in json.dumps(sent).casefold()  # no hidden key reaches any provider

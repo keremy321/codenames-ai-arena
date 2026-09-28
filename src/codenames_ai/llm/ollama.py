@@ -4,24 +4,26 @@ from typing import Any, Self
 
 import httpx
 
+from .base import LLMError, LLMHTTPError, LLMModelError, LLMResponseError, LLMTimeoutError
 
-class OllamaError(RuntimeError):
+
+class OllamaError(LLMError):
     pass
 
 
-class OllamaHTTPError(OllamaError):
+class OllamaHTTPError(OllamaError, LLMHTTPError):
     pass
 
 
-class OllamaTimeoutError(OllamaError):
+class OllamaTimeoutError(OllamaError, LLMTimeoutError):
     pass
 
 
-class OllamaResponseError(OllamaError):
+class OllamaResponseError(OllamaError, LLMResponseError):
     pass
 
 
-class OllamaModelError(OllamaError):
+class OllamaModelError(OllamaError, LLMModelError):
     pass
 
 

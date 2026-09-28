@@ -18,7 +18,7 @@ from typing import Any
 
 from codenames_ai.domain.enums import CardColor, Role, Team
 from codenames_ai.domain.models import GuessDecision, PublicGameState
-from codenames_ai.llm.ollama import OllamaClient, OllamaResponseError
+from codenames_ai.llm.base import LLMClient, LLMResponseError
 
 from .association import (
     RANKER_TEMPERATURE,
@@ -55,7 +55,7 @@ class OperativeTrace:
 
 
 class OperativeAgent(Agent):
-    def __init__(self, team: Team, llm: OllamaClient) -> None:
+    def __init__(self, team: Team, llm: LLMClient) -> None:
         super().__init__(team, Role.OPERATIVE, llm)
         self._cache: tuple[tuple[str, int], frozenset[str], tuple[RankedWord, ...]] | None = None
         self.last_trace: OperativeTrace | None = None
@@ -202,10 +202,10 @@ class OperativeAgent(Agent):
         for attempt in range(2 if required else 1):
             try:
                 return await timed_chat(self.llm, trace.calls, purpose, **request)
-            except OllamaResponseError as exc:
+            except LLMResponseError as exc:
                 logger.warning("[%s] invalid ranking (attempt %d): %s", self.team, attempt + 1, exc)
         if required:
-            raise ValueError("Ollama failed to rank words for a mandatory guess")
+            raise ValueError("LLM failed to rank words for a mandatory guess")
         return {}
 
 

@@ -4,7 +4,7 @@ import pytest
 from playwright.async_api import Page
 
 from codenames_ai.browser.errors import PlayerAssignmentError
-from codenames_ai.browser.identity import detect_assignment, join_room
+from codenames_ai.browser.identity import NICKNAME_CONFIRM_DELAY, detect_assignment, join_room
 from codenames_ai.browser.selectors import ROLE_PANELS
 from codenames_ai.domain.enums import Role, Team
 from codenames_ai.domain.models import PlayerAssignment
@@ -40,9 +40,13 @@ async def lobby(page: Page, *, modal: bool = True, joined: str | None = None) ->
           document.querySelector('#settings-nickname-input').value='BlueSpymasterAI';
           const form=document.querySelector('#welcome');
           const entry=document.querySelector('#nickname');
-          if(entry) entry.addEventListener('keyup',e=>window.typedNickname=e.target.value);
+          if(entry) entry.addEventListener('keyup',e=>{
+            window.typedNickname=e.target.value;
+            window.typedAt=performance.now();
+          });
           if(form) form.onsubmit=e=>{
             e.preventDefault();
+            window.submittedAt=performance.now();
             const name=window.nicknameOverride || window.typedNickname || 'Player1';
             const settings=document.querySelector('#settings-nickname-input');
             if(settings) settings.value=name;
@@ -155,3 +159,16 @@ async def test_missing_join_button_fails_clearly(live_page: Page) -> None:
     assignment = PlayerAssignment(team=Team.BLUE, role=Role.SPYMASTER, nickname="BlueSpymasterAI")
     with pytest.raises(PlayerAssignmentError, match="JOIN TEAM button count=0; panel text='ROLE'"):
         await join_room(live_page, assignment)
+
+
+async def test_nickname_is_confirmed_only_after_a_pause(live_page: Page) -> None:
+    """Typing the nickname, then ~1 s, then Enter Game: the site can miss an instant submit."""
+    assert NICKNAME_CONFIRM_DELAY == pytest.approx(1.0)
+    await lobby(live_page)
+    assignment = PlayerAssignment(team=Team.BLUE, role=Role.SPYMASTER, nickname="BlueSpymasterAI")
+    await join_room(live_page, assignment)
+    typed_nickname, typed_at, submitted_at = await live_page.evaluate(
+        "[typedNickname, typedAt, submittedAt]"
+    )
+    assert typed_nickname == "BSpy"  # the full nickname was in the field before confirming
+    assert submitted_at - typed_at >= NICKNAME_CONFIRM_DELAY * 1000 - 50

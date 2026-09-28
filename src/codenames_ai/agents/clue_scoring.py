@@ -391,6 +391,29 @@ def select_clue(assessments: Sequence[ClueAssessment]) -> ClueAssessment | None:
     return _pick(pool)
 
 
+def prune_dominated(assessments: Sequence[ClueAssessment]) -> list[ClueAssessment]:
+    """Drop (clue, n) when a smaller number of the SAME clue is as good: win within
+    WIN_TIE and less than 0.05 extra expected friendly cards. Such an action could never
+    be selected (select_clue prefers the smaller number on a near-tie), so pruning only
+    removes redundant work and log noise. Numbers are never changed, only dropped."""
+    kept: list[ClueAssessment] = []
+    by_clue: dict[str, list[ClueAssessment]] = {}
+    for a in assessments:
+        by_clue.setdefault(a.clue, []).append(a)
+    for actions in by_clue.values():
+        survivors: list[ClueAssessment] = []
+        for a in sorted(actions, key=lambda x: x.number):
+            dominated = any(
+                b.win_probability >= a.win_probability - WIN_TIE
+                and a.expected_hits - b.expected_hits < 0.05
+                for b in survivors
+            )
+            if not dominated:
+                survivors.append(a)
+        kept += survivors
+    return kept
+
+
 def best_by_size(assessments: Sequence[ClueAssessment]) -> dict[int, ClueAssessment]:
     """Best acceptable action for each clue number (diagnostics and explanations)."""
     best: dict[int, ClueAssessment] = {}

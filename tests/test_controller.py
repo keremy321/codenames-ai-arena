@@ -559,3 +559,73 @@ async def test_starting_team_is_recorded_and_shared_publicly() -> None:
     assert control.starting_team == Team.BLUE
     assert seen[0].starting_team == Team.BLUE
     assert "assassin" not in seen[0].model_dump_json()
+
+
+@pytest.mark.parametrize(
+    "guess,result,winner",
+    [(0, "friendly", Team.BLUE), (1, "assassin", Team.RED)],
+)
+async def test_game_events_are_recorded_after_actions(
+    tmp_path, guess: int, result: str, winner: Team
+) -> None:
+    import json
+
+    from codenames_ai.llm.base import LLMConfig
+    from codenames_ai.recording import MatchRecorder
+
+    recorder = MatchRecorder(
+        tmp_path,
+        room_url="https://codenames.game/room/test",
+        players={"blue_operative": LLMConfig(provider="ollama", model="qwen3:14b")},
+    )
+    game = SharedGame()
+    control = controller(game)
+    control.recorder = recorder
+    control.operatives[GamePhase.BLUE_OPERATIVE] = DebugOperativeAgent(
+        [GuessDecision(indices=(guess,))]
+    )
+    await control.run()  # clue, then one decisive reveal
+    assert control.winner == winner
+    lines = [json.loads(line) for line in recorder.events_path.read_text("utf-8").splitlines()]
+    assert [(e["type"], e.get("team")) for e in lines] == [
+        ("clue", "blue"),
+        ("turn_ended", "blue"),
+        ("guess", "blue"),
+        ("browser_action", "blue"),
+        ("game_over", None),
+    ]
+    assert (lines[0]["word"], lines[0]["number"]) == ("ORBIT", 2)
+    assert lines[1]["role"] == "spymaster"
+    assert (lines[2]["word"], lines[2]["result"]) == (game.cards[guess].word, result)
+    timing = lines[3]
+    assert (timing["action"], timing["word"]) == ("guess", game.cards[guess].word)
+    assert [stage["stage"] for stage in timing["stages"]] == ["game_decided_check"]
+    assert timing["total_ms"] == sum(stage["ms"] for stage in timing["stages"])
+    assert lines[4]["winner"] == winner
+
+
+async def test_one_browser_action_event_per_guess_with_controller_stages(tmp_path) -> None:
+    import json
+
+    from codenames_ai.recording import MatchRecorder
+
+    recorder = MatchRecorder(tmp_path, room_url="https://codenames.game/r/test", players={})
+    game = SharedGame(
+        cards=(
+            Card(index=0, word="MOON", color=CardColor.BLUE),
+            Card(index=1, word="SUN", color=CardColor.BLUE),
+            Card(index=2, word="KING", color=CardColor.ASSASSIN),
+        )
+    )
+    control = controller(game)
+    control.recorder = recorder
+    await control.step()  # clue: no browser_action (guesses only)
+    await control.step()  # MOON: friendly, game continues
+    lines = [json.loads(line) for line in recorder.events_path.read_text("utf-8").splitlines()]
+    (timing,) = [e for e in lines if e["type"] == "browser_action"]
+    assert [s["stage"] for s in timing["stages"]] == [
+        "game_decided_check",
+        "turn_follow_up",
+        "observer_sync",
+    ]
+    assert lines.index(timing) == len(lines) - 1  # written after the observer caught up

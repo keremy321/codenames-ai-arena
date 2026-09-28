@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from playwright.async_api import Page
@@ -9,6 +10,10 @@ from . import selectors as s
 from .errors import PlayerAssignmentError
 
 logger = logging.getLogger(__name__)
+
+# The site sometimes submits the welcome form before it has registered the typed
+# nickname; a short pause between typing and "Enter Game" lets it catch up.
+NICKNAME_CONFIRM_DELAY = 1.0
 
 
 async def open_player_settings(page: Page) -> None:
@@ -96,6 +101,50 @@ async def get_local_nickname(page: Page) -> str:
     return local_name
 
 
+class NicknameEntryError(PlayerAssignmentError):
+    """The welcome form never held the requested nickname long enough to submit it."""
+
+
+async def enter_game(page: Page, nickname: str, *, timeout_ms: float = 10_000) -> None:
+    """Type the nickname into the welcome form (home page, room modal, or welcome dialog),
+    pause, check it is still there, then press that form's Enter Game.
+
+    The live site renders the form on the server and hydrates it later: text typed
+    before hydration can be wiped when the client re-renders the field. The pause
+    doubles as that race's window, so a reset is detected and entry retried once.
+    """
+    # Hydration scripts have run by the load event; the field then stops being replaced.
+    await page.wait_for_load_state("load", timeout=timeout_ms)
+    entry = page.locator(s.ENTRY_NICKNAME)
+    value = ""
+    for attempt in (1, 2):
+        try:
+            await entry.wait_for(state="visible", timeout=timeout_ms)
+            await entry.click(timeout=timeout_ms)  # focus; waits until visible and enabled
+            await entry.fill("", timeout=timeout_ms)  # clear; waits until editable
+            await entry.press_sequentially(nickname, delay=40, timeout=timeout_ms)
+        except PlaywrightTimeoutError as exc:
+            raise NicknameEntryError(f"Nickname field was not ready: {exc}") from exc
+        await asyncio.sleep(NICKNAME_CONFIRM_DELAY)
+        value = await entry.input_value(timeout=timeout_ms)
+        if value == nickname:
+            break
+        logger.warning(
+            "Nickname field holds %r instead of %r (attempt %d); retyping",
+            value,
+            nickname,
+            attempt,
+        )
+    else:
+        raise NicknameEntryError(
+            f"Nickname field was reset before submit (holds {value!r}, wanted {nickname!r})"
+        )
+    # The Enter Game of the form or dialog that owns this field, not any other one.
+    owner = entry.locator("xpath=ancestor::*[self::form or @role='dialog'][1]")
+    scope = owner if await owner.count() == 1 else page
+    await scope.get_by_role("button", name="Enter Game", exact=True).click(timeout=timeout_ms)
+
+
 async def join_room(page: Page, player: PlayerAssignment) -> None:
     """Enter the room and join only the assigned role panel."""
     entry = page.locator(s.ENTRY_NICKNAME)
@@ -116,10 +165,7 @@ async def join_room(page: Page, player: PlayerAssignment) -> None:
             ("red", "spymaster"): "RSpy",
             ("red", "operative"): "ROp",
         }[(player.team.value, player.role.value)]
-        await entry.click()
-        await entry.fill("")
-        await entry.type(requested_name, delay=20)
-        await page.get_by_role("button", name="Enter Game", exact=True).click()
+        await enter_game(page, requested_name)
         try:
             await entry.wait_for(state="hidden", timeout=15_000)
         except PlaywrightTimeoutError as exc:

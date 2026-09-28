@@ -24,7 +24,7 @@ from codenames_ai.domain.models import (
     PublicGameState,
     SpymasterGameState,
 )
-from codenames_ai.llm.ollama import OllamaClient
+from codenames_ai.llm.base import LLMClient
 
 from .cases import OperativeCase, SpymasterCase
 
@@ -75,7 +75,7 @@ def _reveal(cards: tuple[Card, ...], word: str) -> tuple[tuple[Card, ...], Card]
     return tuple(shown if c.index == card.index else c for c in cards), shown
 
 
-async def run_spymaster_case(case: SpymasterCase, llm: OllamaClient) -> CaseResult:
+async def run_spymaster_case(case: SpymasterCase, llm: LLMClient) -> CaseResult:
     result = CaseResult(case.name, "spymaster", case.purpose)
     cards = case.board.cards(case.name)
     labels = _labels(cards, case.team)
@@ -124,6 +124,13 @@ async def run_spymaster_case(case: SpymasterCase, llm: OllamaClient) -> CaseResu
             if trace.focused_regeneration
             else ""
         )
+    )
+    lines.append(
+        "expanded actions: "
+        + " ".join(f"n{n}={k}" for n, k in trace.expanded_sizes.items())
+        + "; finalists: "
+        + (", ".join(f"{c}[{','.join(map(str, ns))}]" for c, ns in trace.finalists) or "-")
+        + f"; verified clue words: {len(trace.verified_words)}; spymaster total {trace.seconds:.1f}s"
     )
     by_clue: dict[str, list] = {}
     for a in trace.assessments:
@@ -309,6 +316,10 @@ async def run_spymaster_case(case: SpymasterCase, llm: OllamaClient) -> CaseResu
         "verified": chosen.verified,
         "exact_ranking_match": exact_match,
         "generated_sizes": trace.generated_sizes,
+        "expanded_sizes": trace.expanded_sizes,
+        "finalists": trace.finalists,
+        "verified_words": trace.verified_words,
+        "spymaster_seconds": round(trace.seconds, 2),
         "focused_regeneration": trace.focused_regeneration,
         "best_by_size": {
             n: [a.clue, a.number, round(a.win_probability, 4), a.verified] for n, a in best.items()
@@ -317,7 +328,7 @@ async def run_spymaster_case(case: SpymasterCase, llm: OllamaClient) -> CaseResu
     return result
 
 
-async def run_operative_case(case: OperativeCase, llm: OllamaClient) -> CaseResult:
+async def run_operative_case(case: OperativeCase, llm: LLMClient) -> CaseResult:
     result = CaseResult(case.name, "operative", case.purpose)
     cards = case.board.cards(case.name)
     state = PublicGameState(

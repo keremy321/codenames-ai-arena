@@ -20,6 +20,7 @@ from codenames_ai.agents.clue_scoring import (
     best_by_size,
     expected_value,
     outcomes,
+    prune_dominated,
     select_clue,
     side_of,
     win_probability,
@@ -446,3 +447,15 @@ def test_single_never_beats_a_materially_better_multi_card_action(ours: int, the
     )
     assert pair.win_probability > single.win_probability + 0.02
     assert select_clue([single, pair]) is pair
+
+
+def test_prune_dominated_drops_redundant_bigger_numbers_only() -> None:
+    sides = board(8, 6)
+    ranking = ranked(("F0", "strong"), ("F1", "strong"), ("F2", "strong"), ("F3", "possible"))
+    motion = assess_actions("MOTION", ["F0", "F1", "F2"], ranking, sides, race(sides))
+    salad = assess_actions("SALAD", ["F4"], ranked(("F4", "strong")), sides, race(sides))
+    kept = prune_dominated(motion + salad)
+    assert {a.action for a in kept} == {("MOTION", 1), ("MOTION", 2), ("MOTION", 3), ("SALAD", 1)}
+    assert all(a in motion + salad for a in kept)  # same objects, numbers untouched
+    # Pruning never changes the choice: pruned actions lose the near-tie anyway.
+    assert select_clue(kept) is select_clue(motion + salad)

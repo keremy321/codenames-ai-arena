@@ -2,7 +2,8 @@
 
 import asyncio
 import logging
-from typing import Protocol
+import time
+from typing import Any, Protocol
 
 from codenames_ai.browser.arena import BrowserPlayer, wait_for_phase
 from codenames_ai.browser.errors import BrowserIntegrationError, GameStateTimeoutError
@@ -15,6 +16,7 @@ from codenames_ai.domain.models import (
     PublicGameState,
     SpymasterGameState,
 )
+from codenames_ai.recording import MatchRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,7 @@ class GameController:
         operatives: dict[GamePhase, OperativeDecisionSource],
         *,
         timeout: float = 15,
+        recorder: MatchRecorder | None = None,
     ) -> None:
         expected = {GamePhase(f"{team}_{role}") for team in ("blue", "red") for role in Role}
         if set(players) != expected:
@@ -60,10 +63,25 @@ class GameController:
         self.clue_history: dict[Team, list[PublicClueMemory]] = {team: [] for team in Team}
         self._current_clue_index: dict[Team, int | None] = {team: None for team in Team}
         self.starting_team: Team | None = None
+        # Recording only: written after actions, never read by any decision.
+        self.recorder = recorder
+        self.winner: Team | None = None
+        self._last_guess: tuple[Team, CardColor | None] | None = None
+        self._last_phase: GamePhase | None = None
+
+    def _record(self, type: str, **fields: Any) -> None:
+        if self.recorder is not None:
+            self.recorder.event(type, **fields)
 
     async def step(self) -> bool:
+        # Browser stages of this step's guess, completed below and logged once.
+        guess_timing: dict[str, Any] | None = None
         phase = await self._stable_phase()
         logger.info("%s TURN", phase.value.replace("_", " ").upper())
+        if phase != self._last_phase and self._last_phase in self.players:
+            ended = self.players[self._last_phase].assignment
+            self._record("turn_ended", team=ended.team, role=ended.role)
+        self._last_phase = phase
         if phase == GamePhase.GAME_OVER:
             return False
         if phase not in self.players:
@@ -97,6 +115,7 @@ class GameController:
                 raise BrowserIntegrationError("Turn changed while choosing a clue")
             await player.submit_clue(decision.word, decision.number)
             self._start_clue(state.team, decision.word, decision.number)
+            self._record("clue", team=state.team, word=decision.word, number=decision.number)
         else:
             if type(state) is not PublicGameState:
                 raise BrowserIntegrationError("Operative session returned non-public state")
@@ -172,13 +191,31 @@ class GameController:
                     if len(matches) != 1:
                         raise BrowserIntegrationError("Decision must select one unrevealed card")
                     result = await player.guess_card(matches[0].word)
+                    guess_timing = {
+                        "action": "guess",
+                        "team": state.team,
+                        "word": result.card.word,
+                        "stages": list(result.stages),
+                    }
+                    lap = time.perf_counter()
                     self._guesses_made += 1
+                    self._last_guess = (state.team, result.card.color)
+                    self._record(
+                        "guess",
+                        team=state.team,
+                        word=result.card.word,
+                        result=guess_result(state.team, result.card.color),
+                        bonus=source_index is not None,
+                    )
                     self._record_guess(
                         state.team, result.card.word, result.card.color, source_index
                     )
                     if result.card.color == CardColor(state.team.value) and source_index is None:
                         self._friendly_guesses_this_turn += 1
-                    if await self._game_decided():
+                    decided = await self._game_decided()
+                    lap = _lap(guess_timing, "game_decided_check", lap)
+                    if decided:
+                        self._record_timing(guess_timing)
                         # No bonus request, no End Guessing: the game is over.
                         self._last_action = fingerprint
                         await self._await_game_over()
@@ -198,11 +235,13 @@ class GameController:
                                 state.clue.number,
                             )
                             await player.end_guessing()
+                    _lap(guess_timing, "turn_follow_up", lap)
                 else:
                     raise BrowserIntegrationError(
                         "Choose one guess or end turn; batches are not executed"
                     )
         self._last_action = fingerprint
+        synced = time.perf_counter()
         # Synchronize the source-of-truth observer after every successful action.
         try:
             async with asyncio.timeout(self.timeout):
@@ -219,7 +258,13 @@ class GameController:
                     await asyncio.sleep(0.1)
         except TimeoutError as exc:
             raise GameStateTimeoutError("Observer did not receive the action result") from exc
+        if guess_timing is not None:
+            _lap(guess_timing, "observer_sync", synced)
+            self._record_timing(guess_timing)
         return True
+
+    def _record_timing(self, timing: dict[str, Any]) -> None:
+        self._record("browser_action", total_ms=sum(s["ms"] for s in timing["stages"]), **timing)
 
     def _start_clue(self, team: Team, word: str, number: int) -> None:
         self.clue_history[team].append(
@@ -365,6 +410,20 @@ class GameController:
     async def run(self) -> None:
         while await self.step():
             continue
+        self.winner = self._decided_winner()
+        self._record("game_over", winner=self.winner)
+
+    def _decided_winner(self) -> Team | None:
+        """Only a reveal ends the game: the assassin loses it for the guessing team,
+        otherwise the revealed card completed its own team's set."""
+        if self._last_guess is None:
+            return None
+        team, color = self._last_guess
+        if color == CardColor.ASSASSIN:
+            return team.other
+        if color in (CardColor.BLUE, CardColor.RED):
+            return Team(color.value)
+        return None
 
     async def _finish_at_guess_limit(self, player: BrowserPlayer, phase: GamePhase) -> None:
         try:
@@ -397,3 +456,17 @@ class GameController:
                     await asyncio.sleep(0.1)
         except TimeoutError as exc:
             raise GameStateTimeoutError("No actionable phase appeared") from exc
+
+
+def guess_result(team: Team, color: CardColor | None) -> str:
+    if color == CardColor(team.value):
+        return "friendly"
+    if color == CardColor(team.other.value):
+        return "opponent"
+    return color.value if color in (CardColor.NEUTRAL, CardColor.ASSASSIN) else "unknown"
+
+
+def _lap(timing: dict[str, Any], stage: str, since: float) -> float:
+    now = time.perf_counter()
+    timing["stages"].append({"stage": stage, "ms": round((now - since) * 1000)})
+    return now

@@ -1,5 +1,7 @@
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
+from typing import Any
 
 from playwright.async_api import Locator, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -24,11 +26,25 @@ from .waits import wait_snapshot
 logger = logging.getLogger(__name__)
 
 
+class StageTimer:
+    """Milliseconds spent in each browser stage, in order, for the match log."""
+
+    def __init__(self) -> None:
+        self._last = time.perf_counter()
+        self.stages: list[dict[str, Any]] = []
+
+    def lap(self, stage: str, **detail: Any) -> None:
+        now = time.perf_counter()
+        self.stages.append({"stage": stage, "ms": round((now - self._last) * 1000), **detail})
+        self._last = now
+
+
 @dataclass(frozen=True)
 class GuessResult:
     card: Card
     phase: GamePhase
     turn_continues: bool
+    stages: tuple[dict[str, Any], ...] = field(default=(), compare=False)
 
 
 class GameActions:
@@ -68,27 +84,70 @@ class GameActions:
             )
         return roots.nth(card.index), card
 
-    async def select_card(self, word: str) -> None:
+    async def select_card(self, word: str, timer: StageTimer | None = None) -> None:
+        """Select one card, tolerating ONE transient failure to register the click.
+
+        Each attempt re-resolves the card from the DOM (fresh locator, never a stale
+        handle) and clicks only if it is not already selected, so a late-registered
+        first click is not toggled off. The single retry happens only while it is still
+        our operative turn and the same card is still unrevealed.
+        """
+        timer = timer or StageTimer()
         await self._guard(Role.OPERATIVE)
-        locator, card = await self.find_card(word)
-        if card.revealed:
-            raise AlreadyRevealedError(f"{card.word} is already revealed")
-        if not card.selected:
-            logger.info("[%s] considering %s", self.assignment.nickname, card.word)
+        timer.lap("guard")
+        expected = GamePhase(f"{self.assignment.team}_{Role.OPERATIVE}")
+        for attempt in (1, 2):
+            locator, card = await self.find_card(word)
+            timer.lap("find_card", attempt=attempt)
+            if card.revealed:
+                raise AlreadyRevealedError(f"{card.word} is already revealed")
+            if not card.selected:
+                logger.info("[%s] considering %s", self.assignment.nickname, card.word)
+                try:
+                    await locator.click(timeout=self.timeout_ms)
+                except PlaywrightTimeoutError as exc:
+                    raise GameStateTimeoutError(f"Could not select {card.word}") from exc
+                timer.lap("select_click", attempt=attempt)
             try:
-                await locator.click(timeout=self.timeout_ms)
-            except PlaywrightTimeoutError as exc:
-                raise GameStateTimeoutError(f"Could not select {card.word}") from exc
-        await wait_snapshot(
-            self.page,
-            "state.cards[v.index]?.selected === true",
-            values={"index": card.index},
-            timeout_ms=self.timeout_ms,
-            description=f"selection of {card.word}",
-        )
+                await wait_snapshot(
+                    self.page,
+                    "state.cards[v.index]?.selected === true",
+                    values={"index": card.index},
+                    timeout_ms=self.timeout_ms,
+                    description=f"selection of {card.word}",
+                )
+                timer.lap("selected_observed", attempt=attempt)
+                return
+            except GameStateTimeoutError:
+                timer.lap("selected_observed", attempt=attempt, outcome="timeout")
+                if attempt == 2 or await self.reader.phase() != expected:
+                    raise
+                _, current = await self.find_card(word)
+                if current.revealed:
+                    raise
+                # Grace period: a slow first click may still register. Clicking again
+                # then could toggle the selection off, so look before clicking.
+                try:
+                    await wait_snapshot(
+                        self.page,
+                        "state.cards[v.index]?.selected === true",
+                        values={"index": card.index},
+                        timeout_ms=self.timeout_ms / 2,
+                        description=f"late selection of {card.word}",
+                    )
+                    timer.lap("late_selection_observed", attempt=attempt)
+                    return
+                except GameStateTimeoutError:
+                    timer.lap("late_selection_observed", attempt=attempt, outcome="timeout")
+                logger.warning(
+                    "[%s] selection of %s not confirmed; retrying once",
+                    self.assignment.nickname,
+                    card.word,
+                )
 
     async def guess_card(self, word: str) -> GuessResult:
-        await self.select_card(word)
+        timer = StageTimer()
+        await self.select_card(word, timer)
         _, card = await self.find_card(word)
         before = GamePhase(f"{self.assignment.team}_{Role.OPERATIVE}")
         confirm = self.page.locator(s.CONFIRM_GUESS)
@@ -102,6 +161,7 @@ class GameActions:
             ) from exc
         if await confirm.count() != 1:
             raise GuessConfirmationNotFoundError("Ambiguous guess confirmation controls")
+        timer.lap("confirm_ready")
         current = await self.reader.read_operative_state(self.assignment.team)
         selected = [c for c in current.cards if c.selected]
         if (
@@ -110,12 +170,14 @@ class GameActions:
             or await self.reader.phase() != before
         ):
             raise BrowserIntegrationError("Selection or turn changed before confirmation")
+        timer.lap("selection_recheck")
         try:
             await confirm.click(timeout=self.timeout_ms)
         except PlaywrightTimeoutError as exc:
             raise GameStateTimeoutError(
                 "Confirmation could not be clicked; do not retry blindly"
             ) from exc
+        timer.lap("confirm_click")
         # Never retry confirmation after timeout: the server may have accepted it.
         await wait_snapshot(
             self.page,
@@ -124,8 +186,10 @@ class GameActions:
             timeout_ms=self.timeout_ms,
             description=f"public reveal of {card.word}",
         )
+        timer.lap("reveal_observed")
         reading = await self.reader.read(self.assignment.team, Role.OPERATIVE)
         revealed = next(c for c in reading.state.cards if c.index == card.index)
+        timer.lap("read_result")
         if revealed.color in (None, CardColor.UNKNOWN):
             raise BrowserIntegrationError(
                 "Revealed card color is unknown; refusing further guesses"
@@ -135,13 +199,14 @@ class GameActions:
             # the site updates the cover before it updates the active panel.
             await self._wait_next_turn(Role.OPERATIVE)
             reading = await self.reader.read(self.assignment.team, Role.OPERATIVE)
+            timer.lap("next_turn_observed")
         logger.info(
             "[%s] confirmed %s; revealed=%s",
             self.assignment.nickname,
             revealed.word,
             revealed.color,
         )
-        return GuessResult(revealed, reading.phase, reading.phase == before)
+        return GuessResult(revealed, reading.phase, reading.phase == before, tuple(timer.stages))
 
     async def end_guessing(self) -> None:
         expected = GamePhase(f"{self.assignment.team}_{Role.OPERATIVE}")

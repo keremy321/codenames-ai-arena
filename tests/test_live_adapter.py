@@ -371,3 +371,114 @@ async def test_debug_snapshot_redaction(live_page: Page, tmp_path: Path) -> None
 
 def test_unknown_cover() -> None:
     assert parse_cover_color("var(--cover-card-bg-unverified-url)") == CardColor.UNKNOWN
+
+
+async def wire_selection(page: Page, *, ignore_clicks: int, late_ms: int = 0) -> None:
+    """The card ignores its first ``ignore_clicks`` clicks (a transient UI failure);
+    with ``late_ms`` the first click registers only after that delay."""
+    await page.evaluate(
+        """({ignore, late})=>{
+        const card=document.querySelector('article[style*="--CardColor:"]');
+        const select=()=>card.querySelector('section').className='absolute inset-0 scale-[1.02]';
+        card.onclick=()=>{
+            window.cardClicks++;
+            if(late && window.cardClicks===1){setTimeout(select, late); return;}
+            if(window.cardClicks>ignore) select();
+        };
+    }""",
+        {"ignore": ignore_clicks, "late": late_ms},
+    )
+
+
+async def test_selection_retries_once_after_ignored_click(live_page: Page) -> None:
+    actions = await board(live_page)
+    await wire_selection(live_page, ignore_clicks=1)
+    await actions.select_card("DRONE")
+    assert await live_page.evaluate("cardClicks") == 2
+    state = await GameReader(live_page).read_operative_state(Team.BLUE)
+    assert state.cards[0].selected
+
+
+async def test_selection_fails_after_one_retry(live_page: Page) -> None:
+    actions = await board(live_page)
+    await wire_selection(live_page, ignore_clicks=5)
+    with pytest.raises(GameStateTimeoutError, match="selection of DRONE"):
+        await actions.select_card("DRONE")
+    assert await live_page.evaluate("cardClicks") == 2
+
+
+async def test_late_selection_is_not_toggled_off_by_retry(live_page: Page) -> None:
+    actions = await board(live_page)
+    await wire_selection(live_page, ignore_clicks=0, late_ms=700)  # after the 500 ms wait
+    await actions.select_card("DRONE")
+    assert await live_page.evaluate("cardClicks") == 1
+
+
+async def test_no_retry_after_turn_changed(live_page: Page) -> None:
+    actions = await board(live_page)
+    await wire_selection(live_page, ignore_clicks=5)
+    await live_page.evaluate(
+        """()=>{const card=document.querySelector('article[style*="--CardColor:"]');
+        const before=card.onclick; card.onclick=()=>{before();
+        document.querySelector('[data-match-slot="instruction"]').textContent=
+            'Give your operatives a clue';};}"""
+    )
+    with pytest.raises(GameStateTimeoutError):
+        await actions.select_card("DRONE")
+    assert await live_page.evaluate("cardClicks") == 1
+
+
+async def test_no_retry_after_card_was_revealed(live_page: Page) -> None:
+    actions = await board(live_page)
+    await wire_selection(live_page, ignore_clicks=5)
+    await live_page.evaluate(
+        """(revealed)=>{const card=document.querySelector('article[style*="--CardColor:"]');
+        const before=card.onclick; card.onclick=()=>{before();
+        card.insertAdjacentHTML('afterend',revealed); card.remove();};}""",
+        snippet("card-revealed-blue"),
+    )
+    with pytest.raises(GameStateTimeoutError):
+        await actions.select_card("DRONE")
+    assert await live_page.evaluate("cardClicks") == 1
+
+
+async def test_guess_reports_each_browser_stage(live_page: Page) -> None:
+    actions = await board(live_page)
+    await wire_guess(live_page)
+    result = await actions.guess_card("DRONE")
+    assert [s["stage"] for s in result.stages] == [
+        "guard",
+        "find_card",
+        "select_click",
+        "selected_observed",
+        "confirm_ready",
+        "selection_recheck",
+        "confirm_click",
+        "reveal_observed",
+        "read_result",
+    ]
+    assert all(isinstance(s["ms"], int) and s["ms"] >= 0 for s in result.stages)
+
+
+async def test_selection_timings_show_the_timeout_and_retry(live_page: Page) -> None:
+    from codenames_ai.browser.actions import StageTimer
+
+    actions = await board(live_page)
+    await wire_selection(live_page, ignore_clicks=1)
+    timer = StageTimer()
+    await actions.select_card("DRONE", timer)
+    observed = [(s["stage"], s.get("attempt"), s.get("outcome")) for s in timer.stages]
+    assert observed == [
+        ("guard", None, None),
+        ("find_card", 1, None),
+        ("select_click", 1, None),
+        ("selected_observed", 1, "timeout"),
+        ("late_selection_observed", 1, "timeout"),
+        ("find_card", 2, None),
+        ("select_click", 2, None),
+        ("selected_observed", 2, None),
+    ]
+    waits = {(s["stage"], s.get("attempt")): s["ms"] for s in timer.stages}
+    # The waits dominate: exactly where a slow live guess would spend its time.
+    assert waits["selected_observed", 1] >= actions.timeout_ms * 0.9
+    assert waits["late_selection_observed", 1] >= actions.timeout_ms / 2 * 0.9
