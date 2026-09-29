@@ -1,4 +1,6 @@
 import json
+from dataclasses import replace
+from pathlib import Path
 
 import httpx
 import pytest
@@ -23,9 +25,10 @@ from codenames_ai.domain.models import (
     SpymasterGameState,
 )
 from codenames_ai.llm.anthropic_client import AnthropicClient
-from codenames_ai.llm.base import LLMClient, LLMResponseError
+from codenames_ai.llm.base import LLMClient, LLMConfig, LLMResponseError
 from codenames_ai.llm.ollama import OllamaClient, OllamaResponseError
 from codenames_ai.llm.openai_client import OpenAIClient
+from codenames_ai.recording import MatchRecorder, RecordedSpymaster
 
 
 class ScriptedLLM:
@@ -373,7 +376,9 @@ async def test_reserve_single_target_round_uses_screen_not_generation() -> None:
     assert agent.last_trace.fallback_round
     second = _clues(llm.calls[2])
     assert not set(first_round["clues"]) & set(second)
-    assert clue.number == 1 and clue.word == second[0]
+    # Every reserve clue is ranked to WORD4; only the one generated for WORD4 is consistent.
+    assert clue.number == 1 and clue.word in second
+    assert agent.last_trace.selected.intended == ("WORD4",)
 
 
 async def test_least_bad_clue_when_nothing_is_acceptable() -> None:
@@ -933,3 +938,190 @@ async def test_operative_plays_on_hosted_providers_with_public_prompt(provider: 
     assert choice.indices == (1,) and choice.source_clue == "SPACE"
     (sent,) = requests
     assert "assassin" not in json.dumps(sent).casefold()  # no hidden key reaches any provider
+
+
+# --- clue naturalness and target consistency -------------------------------------
+
+
+async def test_friendly_guess_with_zero_target_overlap_is_not_a_clean_verification(
+    tmp_path: Path,
+) -> None:
+    # Generated for WORD0; the blind operative would pick WORD1 (also ours).
+    llm = RoutedLLM(plans(("HUGGABLE", ["WORD0"])), {"HUGGABLE": ([1], [])})
+    agent = SpymasterAgent(Team.BLUE, llm)
+    rec = MatchRecorder(tmp_path, room_url="https://codenames.game/r/x", players={})
+    clue = await RecordedSpymaster(agent, rec, LLMConfig(provider="ollama", model="m")).choose_clue(
+        spy_state()
+    )
+    trace = agent.last_trace
+    assert clue.word == "HUGGABLE"  # nothing better: least bad, never an illegal clue
+    assert trace.selected.verified and not trace.selected.acceptable
+    assert (trace.selected.target_overlap, trace.selected.target_consistent) == (0, False)
+    assert "least bad" in trace.note and trace.selection_mode == "fallback"
+    assert trace.regenerated == []  # the retry repeated HUGGABLE: nothing fresh to check
+    # The one extra generation was spent looking for a clue that means what it says.
+    assert llm.kinds == ["generate", "screen", "verify", "generate"]
+    assert trace.focused_regeneration == "no verified clue leads to its intended words"
+    retry = llm.calls[3]["user"]
+    assert "Do not repeat these clues: HUGGABLE" in retry
+    (event,) = map(json.loads, rec.events_path.read_text("utf-8").splitlines())
+    selection = event["selection"]
+    assert (selection["verification_ran"], selection["verification_passed"]) == (True, False)
+    assert selection["target_overlap"] == 0 and selection["target_precision"] == 0.0
+    assert selection["target_consistency_passed"] is False
+    assert selection["generator_targets"] == ["WORD0"]
+    assert selection["expected_guesses"] == ["WORD1"]
+    assert event["regeneration"] == trace.focused_regeneration
+    assert event["selection_mode"] == "fallback"
+
+
+async def test_consistency_failure_regenerates_once_and_picks_the_fresh_clue() -> None:
+    llm = RoutedLLM(
+        [plans(("HUGGABLE", ["WORD0"])), plans(("HUGGABLE", ["WORD0"]), ("PILLOW", ["WORD0"]))],
+        {"HUGGABLE": ([1], []), "PILLOW": ([0], [])},
+    )
+    agent = SpymasterAgent(Team.BLUE, llm)
+    clue = await agent.choose_clue(spy_state())
+    assert (clue.word, clue.number) == ("PILLOW", 1)
+    assert llm.kinds == ["generate", "screen", "verify", "generate", "screen", "verify"]
+    assert _clues(llm.calls[4]) == ["PILLOW"]  # only fresh clues are screened again
+    selected = agent.last_trace.selected
+    assert selected.verified and selected.acceptable and selected.target_overlap == 1
+    assert [c.purpose for c in agent.last_trace.calls] == [
+        "generate",
+        "screen",
+        "verify",
+        "generate-retry",
+        "screen-retry",
+        "verify-retry",
+    ]
+    assert agent.last_trace.regenerated == ["PILLOW"]
+    assert agent.last_trace.selection_mode == "regenerated_verified"
+
+
+async def test_phrase_clues_are_dropped_before_ranking_and_never_submitted(
+    tmp_path: Path,
+) -> None:
+    llm = RoutedLLM(
+        plans(("WHATYOUHUG", ["WORD0"]), ("AIRMOVEMENT", ["WORD1"]), ("ORBIT", ["WORD2"])),
+        {"WHATYOUHUG": ([0], []), "AIRMOVEMENT": ([1], []), "ORBIT": ([2], [])},
+    )
+    agent = SpymasterAgent(Team.BLUE, llm)
+    rec = MatchRecorder(tmp_path, room_url="https://codenames.game/r/x", players={})
+    recorded = RecordedSpymaster(agent, rec, LLMConfig(provider="ollama", model="m"))
+    assert (await recorded.choose_clue(spy_state())).word == "ORBIT"
+    assert all("WHATYOUHUG" not in _clues(c) for c in llm.calls[1:])
+    reasons = dict(agent.last_trace.rejected)
+    assert reasons["WHATYOUHUG"] == "model: unnatural: sentence fragment (what + you + hug)"
+    assert reasons["AIRMOVEMENT"].startswith("model: unnatural: glued noun phrase")
+    (event,) = map(json.loads, rec.events_path.read_text("utf-8").splitlines())
+    logged = {r["clue"]: r["reason"] for r in event["rejected_clues"]}
+    assert logged["WHATYOUHUG"] == reasons["WHATYOUHUG"]
+    assert event["selection"]["target_consistency_passed"] is True
+    assert event["selection_mode"] == "verified" and event["regeneration"] is None
+
+
+async def test_only_illegal_candidates_raise_instead_of_submitting_one() -> None:
+    llm = ScriptedLLM()
+    with pytest.raises(ValueError, match="No safe clue"):
+        await SpymasterAgent(Team.BLUE, llm).choose_clue(
+            spy_state(), candidates=[Candidate("WHATYOUHUG", ("WORD0",), "given")]
+        )
+    assert not llm.calls  # nothing legal to rank
+
+
+async def test_fallback_skips_illegal_even_if_it_scores_best() -> None:
+    # A clue that slipped past preparation (e.g. rules tightened between turns) is still
+    # never submitted: the final guard re-checks the rules before choosing.
+    llm = RoutedLLM(plans(("ORBIT", ["WORD0"])), {"ORBIT": ([9], [])})
+    agent = SpymasterAgent(Team.BLUE, llm)
+    original = agent._verify
+
+    async def smuggle(*args: object) -> list:
+        final = await original(*args)  # type: ignore[arg-type]
+        good = final[0]
+        return [*final, replace(good, clue="WHATYOUHUG", win_probability=0.99)]
+
+    agent._verify = smuggle  # type: ignore[method-assign]
+    clue = await agent.choose_clue(spy_state())
+    assert clue.word == "ORBIT"  # least bad legal clue, not the illegal "best" one
+
+
+async def test_live_tiny_case_keeps_the_verified_acceptable_number() -> None:
+    # Live: PAIR 1 missed its targets, PAIR 2 (verified, acceptable, best) was pruned by
+    # it, which triggered a pointless retry and submitted the screened-only TINY.
+    llm = RoutedLLM(
+        plans(("PAIR", ["WORD0", "WORD1"]), ("TINY", ["WORD2"])),
+        {"PAIR": ([0, 1], []), "TINY": ([2, 9, 10], [])},
+        {"PAIR": ([3], [0])},  # verified: WORD3 (ours, not intended) first
+    )
+    agent = SpymasterAgent(Team.BLUE, llm)
+    clue = await agent.choose_clue(spy_state())
+    trace = agent.last_trace
+    assert (clue.word, clue.number) == ("PAIR", 2)
+    assert trace.selected.verified and trace.selected.acceptable
+    assert trace.selection_mode == "verified" and not trace.focused_regeneration
+    assert [c.purpose for c in trace.calls] == ["generate", "screen", "verify"]
+
+
+def retry_llm(retry_plans: dict, verify_fails: set[str] = frozenset()) -> RoutedLLM:
+    """HUGGABLE is generated for WORD0 but ranked to WORD1; the retry offers ``retry_plans``.
+    Verifying a clue in ``verify_fails`` returns unusable JSON."""
+    llm = RoutedLLM(
+        [plans(("HUGGABLE", ["WORD0"])), retry_plans],
+        {"HUGGABLE": ([1], []), "PILLOW": ([0], []), "CUSHION": ([1], [])},
+    )
+    routed = llm.chat_json
+
+    async def chat_json(**kwargs: object) -> dict:
+        if _kind(kwargs) == "verify" and set(_clues(kwargs)) & verify_fails:
+            llm.calls.append(kwargs)
+            raise LLMResponseError("truncated")
+        return await routed(**kwargs)
+
+    llm.chat_json = chat_json  # type: ignore[method-assign]
+    return llm
+
+
+async def test_unverified_retry_clue_is_an_explicit_fallback_not_a_verified_pick() -> None:
+    llm = retry_llm(plans(("PILLOW", ["WORD0"])), verify_fails={"PILLOW"})
+    agent = SpymasterAgent(Team.BLUE, llm)
+    clue = await agent.choose_clue(spy_state())
+    trace = agent.last_trace
+    purposes = [c.purpose for c in trace.calls]
+    assert purposes[3:] == ["generate-retry", "screen-retry", "verify-retry"]
+    assert not trace.calls[-1].ok  # the retry verification ran and failed
+    # PILLOW looked fine when screened, but it was never verified.
+    assert clue.word == "PILLOW" and not trace.selected.verified
+    assert trace.selection_mode == "fallback"
+    assert trace.note == "no verified action is acceptable; using a screened-only estimate"
+
+
+async def test_retry_clue_that_fails_verification_follows_the_fallback() -> None:
+    # CUSHION (for WORD0) is also ranked to WORD1: verified, but inconsistent.
+    llm = retry_llm(plans(("CUSHION", ["WORD0"])))
+    agent = SpymasterAgent(Team.BLUE, llm)
+    await agent.choose_clue(spy_state())
+    trace = agent.last_trace
+    assert [c.purpose for c in trace.calls][3:] == [
+        "generate-retry",
+        "screen-retry",
+        "verify-retry",
+    ]
+    assert any(a.clue == "CUSHION" and a.verified for a in trace.assessments)
+    assert trace.selected.verified and not trace.selected.acceptable
+    assert trace.selection_mode == "fallback" and "least bad" in trace.note
+    assert [c.purpose for c in trace.calls].count("generate-retry") == 1  # never twice
+
+
+async def test_illegal_retry_clues_are_rejected_before_any_check() -> None:
+    llm = retry_llm(plans(("WHATYOUHUG", ["WORD0"]), ("AIRMOVEMENT", ["WORD0"])))
+    agent = SpymasterAgent(Team.BLUE, llm)
+    clue = await agent.choose_clue(spy_state())
+    trace = agent.last_trace
+    assert clue.word == "HUGGABLE"  # the least bad legal clue, flagged as a fallback
+    assert [c.purpose for c in trace.calls][3:] == ["generate-retry"]  # nothing to screen
+    reasons = dict(trace.rejected)
+    assert reasons["WHATYOUHUG"].startswith("retry: unnatural")
+    assert reasons["AIRMOVEMENT"].startswith("retry: unnatural")
+    assert trace.regenerated == [] and trace.selection_mode == "fallback"

@@ -459,3 +459,72 @@ def test_prune_dominated_drops_redundant_bigger_numbers_only() -> None:
     assert all(a in motion + salad for a in kept)  # same objects, numbers untouched
     # Pruning never changes the choice: pruned actions lose the near-tie anyway.
     assert select_clue(kept) is select_clue(motion + salad)
+
+
+# --- target consistency: the clue must still mean what it was generated for ---------
+
+
+def test_friendly_guess_unrelated_to_the_generator_target_fails_consistency() -> None:
+    # WHATYOUHUG live case: generated for WALL, the operative would pick CHEST (ours).
+    sides = board(5, 5)
+    drifted = assess_action("HUG", 1, ["F0"], ranked(("F1", "strong")), sides, race(sides))
+    meant = assess_action("HUG", 1, ["F1"], ranked(("F1", "strong")), sides, race(sides))
+    assert (drifted.target_overlap, drifted.target_precision) == (0, 0.0)
+    assert not drifted.target_consistent and not drifted.acceptable and not drifted.vetoed
+    assert "target mismatch" in drifted.reason
+    # Same simulated outcome, so the same win estimate: only the consistency differs.
+    assert drifted.win_probability == pytest.approx(meant.win_probability)
+    assert meant.target_consistent and meant.acceptable and meant.target_overlap == 1
+    assert select_clue([drifted, meant]) is meant
+
+
+@pytest.mark.parametrize(
+    "number,intended,listed,consistent",
+    [
+        (2, ["F0", "F1"], ["F0", "F2"], True),  # one of two
+        (2, ["F0", "F1"], ["F2", "F3", "F0"], False),  # intended word only third
+        (3, ["F0", "F1", "F2"], ["F3", "F0", "F4"], True),  # one of three is enough
+        (4, ["F0", "F1", "F2", "F3"], ["F0", "F4", "F5", "F6"], False),  # four need two
+        (4, ["F0", "F1", "F2", "F3"], ["F4", "F1", "F5", "F2"], True),
+        (3, ["F0"], ["F1", "F2", "F0"], True),  # a single target within the top three
+    ],
+)
+def test_target_overlap_requirement(
+    number: int, intended: list[str], listed: list[str], consistent: bool
+) -> None:
+    sides = board(8, 5)
+    ranking = ranked(*((word, "strong") for word in listed))
+    action = assess_action("C", number, intended, ranking, sides, race(sides))
+    assert action.target_consistent is consistent
+    assert action.acceptable is consistent  # every listed word is ours: only this decides
+
+
+def test_pruning_never_drops_an_acceptable_action_for_an_unacceptable_one() -> None:
+    # Live TINY case: PAIR 1 misses its targets (WORD3 is ours but not intended), PAIR 2
+    # reaches one with the same outcome. PAIR 2 must survive: it is the acceptable one.
+    sides = board(6, 5)
+    ranking = ranked(("F3", "strong"), ("F0", "possible"))
+    one, two = assess_actions(
+        "PAIR", ["F0", "F1"], ranking, sides, race(sides), numbers=[1, 2], verified=True
+    )
+    assert not one.acceptable and two.acceptable
+    # By value PAIR 2 is dominated: the same win and hits within the pruning margins.
+    assert two.win_probability - one.win_probability < 0.01
+    assert two.expected_hits - one.expected_hits < 0.05
+    assert prune_dominated([one, two]) == [one, two]
+    assert select_clue(prune_dominated([one, two])) is two
+    # Equally acceptable actions are still pruned as before.
+    consistent = ranked(("F0", "strong"), ("F3", "possible"))
+    a, b = assess_actions(
+        "PAIR", ["F0", "F1"], consistent, sides, race(sides), numbers=[1, 2], verified=True
+    )
+    assert a.acceptable and b.acceptable and prune_dominated([a, b]) == [a]
+
+
+def test_target_precision_counts_only_predicted_guesses() -> None:
+    sides = board(5, 5, {"ASH": N})
+    tiny = ranked(("F0", "strong"), ("ASH", "strong"), ("F1", "strong"))
+    two = assess_action("TINY", 2, ["F0"], tiny, sides, race(sides))
+    assert (two.target_overlap, two.target_precision) == (1, 0.5)  # picks F0, ASH
+    alone = assess_action("TINY", 2, ["F0"], ranked(("F0", "strong")), sides, race(sides))
+    assert (alone.target_overlap, alone.target_precision) == (1, 1.0)  # one pick, intended

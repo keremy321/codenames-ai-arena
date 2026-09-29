@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import logging
+from collections.abc import Sequence
 from pathlib import Path
 
 from playwright.async_api import Error as PlaywrightError
@@ -21,7 +22,7 @@ from codenames_ai.domain.enums import GamePhase, Role, Team
 from codenames_ai.llm.base import PROVIDERS, LLMClient, LLMConfig, LLMError
 from codenames_ai.llm.factory import open_llm_clients
 from codenames_ai.llm.ollama import OllamaClient, OllamaError
-from codenames_ai.llm.preflight import llm_preflight
+from codenames_ai.llm.preflight import WarmUp, llm_preflight
 from codenames_ai.recording import LOGS_DIR, MatchRecorder, RecordedOperative, RecordedSpymaster
 
 ARENA_ROLES = [
@@ -77,12 +78,12 @@ async def run_arena(args: argparse.Namespace, settings: Settings) -> None:
     llms = {(team, role): settings.llm_for(team, role) for team, role in ARENA_ROLES}
     print("Checking LLM providers...", flush=True)
     async with (
-        llm_preflight(llms.values(), settings),
+        llm_preflight(llms.values(), settings) as warmups,
         open_llm_clients(llms, settings) as clients,
     ):
         print(f"\n{format_llms(llms)}\n", flush=True)
         async with BrowserClient(headless=settings.headless) as browser:
-            await play_match(args, settings, browser, llms, clients)
+            await play_match(args, settings, browser, llms, clients, warmups=warmups)
 
 
 async def play_match(
@@ -91,6 +92,8 @@ async def play_match(
     browser: BrowserClient,
     llms: dict[tuple[Team, Role], LLMConfig],
     clients: dict[tuple[Team, Role], LLMClient],
+    *,
+    warmups: Sequence[WarmUp] = (),
 ) -> None:
     """Create (or join) the room, seat four players, start, play, and record the match."""
     arena = Arena(browser)
@@ -120,6 +123,20 @@ async def play_match(
         recorder = MatchRecorder(
             LOGS_DIR, room_url=room_url, players=players, secret_values=secret_values(settings)
         )
+        if warmups:
+            # Startup only: the match duration is measured from the game start.
+            recorder.event(
+                "llm_warmup",
+                models=[
+                    {
+                        "provider": "ollama",
+                        "model": w.model,
+                        "seconds": round(w.seconds, 2),
+                        "already_loaded": w.already_loaded,
+                    }
+                    for w in warmups
+                ],
+            )
         recorder.event("room_ready", room_url=room_url, created_by_arena=host is not None)
         await arena.open(room_url)
         await arena.verify()

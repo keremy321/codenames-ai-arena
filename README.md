@@ -32,7 +32,7 @@ The default configuration in `.env.example` uses `http://localhost:11434`, `qwen
 python -m codenames_ai.main arena
 ```
 
-Before any browser opens, the arena checks every configured model. If the local Ollama server is not running, the arena starts `ollama serve` itself and stops it again at exit; a server that was already running is left alone. A remote `OLLAMA_BASE_URL` is never started locally. A missing model stops the run with the matching `ollama pull` command. OpenAI and Anthropic roles are checked for their API key only, so startup spends no tokens.
+Before any browser opens, the arena checks every configured model. If the local Ollama server is not running, the arena starts `ollama serve` itself and stops it again at exit; a server that was already running is left alone. A remote `OLLAMA_BASE_URL` is never started locally. A missing model stops the run with the matching `ollama pull` command. Each distinct Ollama model is then warmed with one tiny request (`Ollama warm-up: qwen3:14b ... 8.4s`), so the first spymaster turn does not pay for loading it; a model that cannot run stops the run here. Every Ollama request asks the server to keep the model loaded for `OLLAMA_KEEP_ALIVE` (default `30m`). OpenAI and Anthropic roles are checked for their API key only, so startup spends no tokens.
 
 The arena then opens a host window (`ArenaHost`, a spectator; change it with `--host-nickname`) that creates a new room. It opens four player windows that join these roles:
 

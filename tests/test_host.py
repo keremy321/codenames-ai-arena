@@ -21,6 +21,7 @@ from codenames_ai.config import Settings
 from codenames_ai.domain.enums import Role, Team
 from codenames_ai.domain.models import PlayerAssignment
 from codenames_ai.llm.base import LLMConfig
+from codenames_ai.llm.preflight import WarmUp
 from codenames_ai.recording import RecordedOperative, RecordedSpymaster
 
 ROOM = "https://codenames.game/r/radun-kapuf"
@@ -101,6 +102,9 @@ async def site(route: Route) -> None:
     await route.fulfill(body=f"<html><body>{body}</body></html>", content_type="text/html")
 
 
+REDUCED_MOTION = "matchMedia('(prefers-reduced-motion: reduce)').matches"
+
+
 @pytest.fixture
 async def offline_client(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[BrowserClient]:
     SITE.clear()
@@ -109,8 +113,8 @@ async def offline_client(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Brows
         assert client._browser is not None
         original = client._browser.new_context
 
-        async def offline() -> BrowserContext:
-            context = await original()
+        async def offline(**options: Any) -> BrowserContext:
+            context = await original(**options)
             await context.route("**/*", site)
             return context
 
@@ -153,6 +157,9 @@ async def test_host_creates_room_seats_four_players_then_starts(
     player_contexts = {id(p.context) for p in arena.players.values()}
     assert id(host.context) not in player_contexts  # the host is never a player
     assert len(offline_client._browser.contexts) == 5  # type: ignore[union-attr]
+    # Host and every player shorten the site's animations; the state waits stay.
+    for page in [host.page, *(p.context.pages[0] for p in arena.players.values())]:
+        assert await page.evaluate(REDUCED_MOTION)
 
     await seat_players(host.page)
     await host.wait_for_players(timeout=5)
@@ -312,7 +319,12 @@ class Flow:
         monkeypatch.setattr(main_module, "LOGS_DIR", tmp_path / "logs")
         monkeypatch.setattr(builtins, "input", prompt)
 
-    async def play(self, room: str | None = None, settings: Settings | None = None) -> None:
+    async def play(
+        self,
+        room: str | None = None,
+        settings: Settings | None = None,
+        warmups: tuple[WarmUp, ...] = (),
+    ) -> None:
         args = argparse.Namespace(room=room, host_nickname="ArenaHost", wait_seconds=5)
         config = LLMConfig(provider="ollama", model="qwen3:14b")
         roles = [(t, r) for t in Team for r in Role]
@@ -322,6 +334,7 @@ class Flow:
             object(),  # type: ignore[arg-type]
             dict.fromkeys(roles, config),
             dict.fromkeys(roles, object()),  # type: ignore[arg-type]
+            warmups=warmups,
         )
 
 
@@ -386,6 +399,19 @@ async def test_crash_finalizes_match_with_error(
     assert types == ["room_ready", "players_ready", "match_started", "match_ended"]
     for path in match.iterdir():
         assert "sk-ant-SECRET" not in path.read_text("utf-8")
+
+
+async def test_warmups_are_logged_before_the_room_and_match(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    flow = Flow(monkeypatch, tmp_path)
+    await flow.play(warmups=(WarmUp("qwen3:14b", 8.4321, False),))
+    (match,) = (tmp_path / "logs").iterdir()
+    lines = [json.loads(line) for line in (match / "events.jsonl").open()]
+    assert [e["type"] for e in lines][:2] == ["llm_warmup", "room_ready"]
+    assert lines[0]["models"] == [
+        {"provider": "ollama", "model": "qwen3:14b", "seconds": 8.43, "already_loaded": False}
+    ]
 
 
 def test_cli_arena_creates_a_room_when_none_is_given(monkeypatch: pytest.MonkeyPatch) -> None:

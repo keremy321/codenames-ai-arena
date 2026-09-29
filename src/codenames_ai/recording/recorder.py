@@ -241,10 +241,16 @@ def selection_record(selected: Any, state: SpymasterGameState) -> dict[str, Any]
     - expected_guesses: friendly words the blind operative most likely finds with
       exactly this number (never more than the number).
     - predicted_ranking: the blind operative ranking the scores were computed from.
-    - verification_ran: that ranking came from the operative-identical request.
-    - verification_passed: it ran AND the action passed the safety checks
-      (acceptable: not vetoed, operative's top pick friendly); None if it did not run.
-      A selected action can fail them when no candidate passed (see selection_note).
+    - verification_ran: that ranking came from the operative-identical request. The
+      event's selection_mode says whether this was a normal verified choice
+      (verified / regenerated_verified) or the degraded fallback.
+    - verification_passed: it ran AND the action passed the checks (acceptable: not
+      vetoed, operative's top pick friendly, target consistency); None if it did not
+      run. A selected action can fail them when no candidate passed (see selection_note).
+    - target_overlap / target_precision: generator targets among the operative's first
+      ``number`` predicted picks, as a count and as a share of those picks (TINY 2 with
+      one target and picks DWARF, ASH: 1 and 0.5).
+    - target_consistency_passed: that overlap was enough (clue_scoring.required_overlap).
     """
     ran = bool(getattr(selected, "verified", False))
     acceptable = bool(getattr(selected, "acceptable", False))
@@ -260,6 +266,9 @@ def selection_record(selected: Any, state: SpymasterGameState) -> dict[str, Any]
         "acceptable": acceptable,
         "vetoed": bool(getattr(selected, "vetoed", False)),
         "reason": getattr(selected, "reason", None),
+        "target_overlap": getattr(selected, "target_overlap", None),
+        "target_precision": _rounded(getattr(selected, "target_precision", None)),
+        "target_consistency_passed": getattr(selected, "target_consistent", None),
         **{name: _rounded(getattr(selected, name, None)) for name in METRIC_FIELDS},
     }
 
@@ -280,8 +289,15 @@ class RecordedSpymaster(_RecordedAgent):
             clue=decision.word,
             number=decision.number,
             selection=selection_record(selected, state) if selected is not None else None,
+            selection_mode=getattr(trace, "selection_mode", "") or None,
             selection_note=getattr(trace, "note", "") or None,
             fallback_round=getattr(trace, "fallback_round", None),
+            regeneration=getattr(trace, "focused_regeneration", "") or None,
+            # Clues dropped before any ranking: legality, naturalness, reuse.
+            rejected_clues=[
+                {"clue": clue, "reason": reason}
+                for clue, reason in getattr(trace, "rejected", None) or []
+            ],
         )
         return decision
 
