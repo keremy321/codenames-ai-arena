@@ -5,7 +5,7 @@ from codenames_ai.config import Settings
 
 from .anthropic_client import AnthropicClient
 from .base import PROVIDERS, LLMClient, LLMConfig, LLMError
-from .ollama import OllamaClient
+from .ollama import OllamaClient, keep_alive_value
 from .openai_client import OpenAIClient
 
 
@@ -14,7 +14,12 @@ def create_llm_client(
 ) -> OllamaClient | OpenAIClient | AnthropicClient:
     """A new model-bound client; the caller closes it (``async with``)."""
     if provider == "ollama":
-        return OllamaClient(settings.ollama_base_url, model, timeout=settings.ollama_timeout)
+        return OllamaClient(
+            settings.ollama_base_url,
+            model,
+            timeout=settings.ollama_timeout,
+            keep_alive=keep_alive_value(settings.ollama_keep_alive),
+        )
     if provider == "openai":
         return OpenAIClient(model, api_key=api_key(provider, settings))
     if provider == "anthropic":

@@ -27,6 +27,12 @@ class OllamaModelError(OllamaError, LLMModelError):
     pass
 
 
+def keep_alive_value(text: str) -> str | int:
+    """Ollama's keep_alive: a duration ("30m") or whole seconds (-1 keeps it loaded)."""
+    text = text.strip()
+    return int(text) if text.lstrip("-").isdigit() else text
+
+
 class OllamaClient:
     def __init__(
         self,
@@ -34,9 +40,12 @@ class OllamaClient:
         model: str = "qwen3:14b",
         *,
         timeout: float = 120,
+        keep_alive: str | int | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.model = model
+        # Sent with every request so the model stays resident for the whole match.
+        self.keep_alive = keep_alive
         self._http = httpx.AsyncClient(
             base_url=base_url.rstrip("/") + "/", timeout=timeout, transport=transport
         )
@@ -64,21 +73,46 @@ class OllamaClient:
         options: dict[str, Any] = {"num_predict": num_predict}
         if temperature is not None:
             options["temperature"] = temperature
+        payload = await self._chat(
+            {
+                "format": schema or "json",
+                "options": options,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            }
+        )
         try:
-            response = await self._http.post(
-                "api/chat",
-                json={
-                    "model": self.model,
-                    "stream": False,
-                    "think": False,
-                    "format": schema or "json",
-                    "options": options,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                },
-            )
+            content = payload["message"]["content"]
+            if not isinstance(content, str):
+                raise TypeError("content must be text")
+            result = json.loads(content)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise OllamaResponseError("Ollama message.content must contain valid JSON") from exc
+        if not isinstance(result, dict):
+            raise OllamaResponseError("Ollama JSON output must be an object")
+        return result
+
+    async def warm_up(self) -> None:
+        """Load the model and run one token, so the first game call does not pay for it.
+
+        Same endpoint and option names as chat_json (no num_ctx): a different context
+        size would make Ollama reload the model on the first real call.
+        """
+        payload = await self._chat(
+            {"options": {"num_predict": 1}, "messages": [{"role": "user", "content": "Say OK."}]}
+        )
+        if not isinstance(payload.get("message"), dict):
+            raise OllamaResponseError(f"Ollama warm-up of {self.model} returned no message")
+
+    async def _chat(self, body: dict[str, Any]) -> dict[str, Any]:
+        """POST api/chat; the reply envelope, with transport and server errors mapped."""
+        body = {"model": self.model, "stream": False, "think": False, **body}
+        if self.keep_alive is not None:
+            body["keep_alive"] = self.keep_alive
+        try:
+            response = await self._http.post("api/chat", json=body)
         except httpx.TimeoutException as exc:
             raise OllamaTimeoutError(f"Ollama timed out using model {self.model}") from exc
         except httpx.RequestError as exc:
@@ -95,13 +129,6 @@ class OllamaClient:
             )
         if response.is_error:
             raise OllamaHTTPError(f"Ollama HTTP {response.status_code}")
-        try:
-            content = payload["message"]["content"]
-            if not isinstance(content, str):
-                raise TypeError("content must be text")
-            result = json.loads(content)
-        except (ValueError, KeyError, TypeError) as exc:
-            raise OllamaResponseError("Ollama message.content must contain valid JSON") from exc
-        if not isinstance(result, dict):
-            raise OllamaResponseError("Ollama JSON output must be an object")
-        return result
+        if not isinstance(payload, dict):
+            raise OllamaResponseError("Ollama response envelope must be an object")
+        return payload

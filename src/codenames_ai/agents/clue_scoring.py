@@ -22,6 +22,11 @@ probability averaged over its outcomes. Failure types differ through the race it
 a neutral card only ends the turn; an opponent card also advances the opponent (and
 loses if it was their last); the assassin loses the game.
 
+Target consistency: the first ``number`` listed words must share enough words with the
+generator's intended targets (target_consistency). A clue whose predicted guesses are
+friendly but unrelated to what it was generated for is not acceptable: its meaning
+drifted, and the lucky prediction is the least trustworthy part of the simulation.
+
 Assassin handling: listed as strong -> hard veto. Listed as possible -> kept, but its
 pick weight gets no position discount (tier and order noise matter most for a
 catastrophe), so it costs a large, race-dependent share of win probability.
@@ -111,10 +116,19 @@ class ClueAssessment:
     acceptable: bool
     vetoed: bool
     reason: str
+    target_overlap: int = 0  # intended words among the first ``number`` listed words
+    target_consistent: bool = True
 
     @property
     def action(self) -> tuple[str, int]:
         return (self.clue, self.number)
+
+    @property
+    def target_precision(self) -> float:
+        """Share of the predicted guesses (the first ``number`` listed words; fewer when
+        fewer are listed) that were intended. Logs only; selection uses the overlap."""
+        predicted = min(self.number, len(self.ranking))
+        return self.target_overlap / predicted if predicted else 0.0
 
     @property
     def risk(self) -> float:
@@ -258,6 +272,23 @@ def likely_hits(
     return tuple(hits)
 
 
+def required_overlap(intended: int, number: int) -> int:
+    """At least one intended word, and a third of the comparable ones (1, 1, 1, 2)."""
+    return (min(intended, number) + 2) // 3
+
+
+def target_consistency(
+    ranking: Sequence[RankedWord], intended: Sequence[str], number: int
+) -> tuple[int, bool]:
+    """(overlap, passed): intended words among the operative's first ``number`` picks.
+
+    Without generator targets (none recorded) there is nothing to compare: it passes.
+    """
+    predicted = {r.word for r in ranking[:number]}
+    overlap = len(predicted & set(intended))
+    return overlap, overlap >= required_overlap(len(intended), number)
+
+
 def action_numbers(
     intended: int,
     ranking: Sequence[RankedWord],
@@ -291,6 +322,7 @@ def assess_action(
         raise ValueError(f"Illegal clue number {number} with {race.ours} cards left")
     ranking = tuple(r for r in ranking if r.fit in utility.pick_weight)
     intended = tuple(intended)
+    overlap, consistent = target_consistency(ranking, intended, number)
 
     def result(
         dist: Sequence[Outcome], win: float, p_first: float, ok: bool, veto: bool, why: str
@@ -318,6 +350,8 @@ def assess_action(
             acceptable=ok,
             vetoed=veto,
             reason=why,
+            target_overlap=overlap,
+            target_consistent=consistent,
         )
 
     if not ranking:
@@ -335,6 +369,13 @@ def assess_action(
     top = ranking[0]
     if sides[top.word] is not Side.FRIENDLY:
         why = f"operative's top pick {top.word} is {sides[top.word].value}"
+        return result(dist, win, p_first, False, False, why)
+    if not consistent:
+        predicted = [r.word for r in ranking[:number]]
+        why = (
+            f"target mismatch: predicted {predicted} share {overlap} of the "
+            f"{required_overlap(len(intended), number)} needed with intended {list(intended)}"
+        )
         return result(dist, win, p_first, False, False, why)
     why = f"first guess ours {p_first:.0%}"
     if assassin is not None:
@@ -395,7 +436,11 @@ def prune_dominated(assessments: Sequence[ClueAssessment]) -> list[ClueAssessmen
     """Drop (clue, n) when a smaller number of the SAME clue is as good: win within
     WIN_TIE and less than 0.05 extra expected friendly cards. Such an action could never
     be selected (select_clue prefers the smaller number on a near-tie), so pruning only
-    removes redundant work and log noise. Numbers are never changed, only dropped."""
+    removes redundant work and log noise. Numbers are never changed, only dropped.
+
+    Only an action at least as acceptable dominates: target consistency differs by
+    number (MOTION 1 can miss its targets while MOTION 2 reaches one), and select_clue
+    never prefers an unacceptable action to an acceptable one."""
     kept: list[ClueAssessment] = []
     by_clue: dict[str, list[ClueAssessment]] = {}
     for a in assessments:
@@ -406,6 +451,7 @@ def prune_dominated(assessments: Sequence[ClueAssessment]) -> list[ClueAssessmen
             dominated = any(
                 b.win_probability >= a.win_probability - WIN_TIE
                 and a.expected_hits - b.expected_hits < 0.05
+                and (b.acceptable or not a.acceptable)
                 for b in survivors
             )
             if not dominated:

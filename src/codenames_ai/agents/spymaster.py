@@ -8,7 +8,10 @@ Per clue the normal cost is 3-4 qwen3 calls (5 with a focused regeneration):
    order; in a critical endgame it asks for an all-remaining group first.
    Code adds exact theme overlaps (multi-word) and specific single-word fallbacks.
 2. focused regeneration, at most once and only if multi-card plans are nearly absent
-   when behind/critical, or a critical endgame has no all-in attempt.
+   when behind/critical, or a critical endgame has no all-in attempt. The same single
+   extra generation is spent after verification instead, if it was not used yet and no
+   verified action is acceptable while some failed target consistency (the operative
+   would guess other words than the clue was generated for).
 3. screen: one batched colour-blind ranking; multi-word clues fill most of the pool,
    single-word fallbacks the rest.
 4. verify (1-2 short calls; up to 2 more only if no verified action is acceptable): the
@@ -42,6 +45,7 @@ from .association import (
     single_clue_request,
 )
 from .base import Agent, LLMCall, describe_calls, timed_chat
+from .clue_naturalness import phrase_problem
 from .clue_scoring import (
     DEFAULT_UTILITY,
     ClueAssessment,
@@ -73,6 +77,7 @@ COMPACT_JSON = " Reply with compact single-line JSON: no line breaks or indentat
 THEMES_PER_WORD = 2
 SPECIFIC_PER_WORD = 2
 GENERATOR_TEMPERATURE = 0.4
+RETRY_STAGE = "-retry"  # call-purpose suffix for the retry generation's own checks
 # Real clue words longer than this are rare; glued phrases (MUSICALINSTRUMENT) are not.
 MAX_CLUE_LETTERS = 13
 _CLUE_PATTERN = re.compile(r"[^\W\d_]+(?:[-'][^\W\d_]+)*")
@@ -140,6 +145,8 @@ def clue_problem(clue: str, board_words: set[str]) -> str | None:
         return "too long; likely a glued compound"
     if _is_board_derivative(clue, board_words):
         return "repeats, contains, or derives from a board word"
+    if phrase := phrase_problem(clue):
+        return f"unnatural: {phrase}"
     return None
 
 
@@ -157,7 +164,7 @@ class Candidate:
 
     clue: str
     targets: tuple[str, ...]
-    source: str  # model | focus | overlap | specific | given
+    source: str  # model | focus | retry | overlap | specific | given
     connection: str = ""  # private generation note; never sent to any ranking request
 
 
@@ -181,6 +188,7 @@ class SpymasterTrace:
     rejected: list[tuple[str, str]] = field(default_factory=list)
     generated_sizes: dict[int, int] = field(default_factory=dict)
     focused_regeneration: str = ""  # why the one extra generation ran, if it did
+    regenerated: list[str] = field(default_factory=list)  # fresh clue words of the retry
     screened: list[ClueAssessment] = field(default_factory=list)
     expanded_sizes: dict[int, int] = field(default_factory=dict)  # after pruning
     finalists: list[tuple[str, list[int]]] = field(default_factory=list)
@@ -189,6 +197,10 @@ class SpymasterTrace:
     verified: list[ClueAssessment] = field(default_factory=list)
     assessments: list[ClueAssessment] = field(default_factory=list)  # final estimates
     selected: ClueAssessment | None = None
+    # verified: a verified acceptable action; regenerated_verified: the same, for a clue
+    # from the retry generation; fallback: no verified action was acceptable, so a
+    # screened-only estimate or the least bad candidate was submitted (see note).
+    selection_mode: str = ""
     fallback_round: bool = False
     explanation: str = ""
     note: str = ""
@@ -289,8 +301,9 @@ class SpymasterAgent(Agent):
         trace = SpymasterTrace(self.team, race)
         self.last_trace = trace
         logger.info("[%s] race: %s", self.team, race.describe())
+        missed = self.missed_targets(state)
         if candidates is None:
-            pool = await self._candidates(board, race, trace, self.missed_targets(state))
+            pool = await self._candidates(board, race, trace, missed)
         else:
             given = [(c.clue, c.targets, "given", c.connection) for c in candidates]
             pool = self._prepare(board, trace, given)
@@ -304,9 +317,14 @@ class SpymasterAgent(Agent):
             screened += await self._screen(board, race, trace, reserve[:POOL_SIZE])
         trace.screened = screened
         trace.assessments = prune_dominated(await self._verify(board, race, trace, screened))
+        if candidates is None and self._needs_retry(trace):
+            await self._retry_unclear(board, race, trace, missed)
+        # Last guard: a clue that breaks a rule is never submitted, even as a fallback.
+        board_words = set(board.all_words)
+        legal = [a for a in trace.assessments if clue_problem(a.clue, board_words) is None]
         # Submit a verified action whenever one is acceptable.
-        verified_ok = [a for a in trace.assessments if a.verified and a.acceptable]
-        choice = select_clue(verified_ok or trace.assessments)
+        verified_ok = [a for a in legal if a.verified and a.acceptable]
+        choice = select_clue(verified_ok or legal)
         if choice is None:
             trace.note = "every candidate was invalid, unassessed, or vetoed"
             logger.error("[%s] no safe clue: %s", self.team, describe_calls(trace.calls))
@@ -314,6 +332,15 @@ class SpymasterAgent(Agent):
         if not choice.acceptable:
             trace.note = "no acceptable action; using the least bad non-vetoed candidate"
             logger.warning("[%s] %s", self.team, trace.note)
+        elif not choice.verified:
+            trace.note = "no verified action is acceptable; using a screened-only estimate"
+            logger.warning("[%s] %s", self.team, trace.note)
+        if not (choice.verified and choice.acceptable):
+            trace.selection_mode = "fallback"
+        elif choice.clue in trace.regenerated:
+            trace.selection_mode = "regenerated_verified"
+        else:
+            trace.selection_mode = "verified"
         trace.selected = choice
         trace.explanation = explain_choice(choice, trace.assessments, race)
         self.used_clues.add(choice.clue.casefold())
@@ -397,6 +424,53 @@ class SpymasterAgent(Agent):
             except LLMResponseError as exc:
                 logger.warning("[%s] focused regeneration failed: %s", self.team, exc)
         return pool
+
+    @staticmethod
+    def _needs_retry(trace: SpymasterTrace) -> bool:
+        """No verified action is acceptable, some failed target consistency, and the one
+        extra generation is still unused."""
+        return (
+            not trace.focused_regeneration
+            and not any(a.verified and a.acceptable for a in trace.assessments)
+            and any(
+                not a.target_consistent and not a.vetoed and a.ranking for a in trace.assessments
+            )
+        )
+
+    async def _retry_unclear(
+        self,
+        board: _Board,
+        race: RaceState,
+        trace: SpymasterTrace,
+        missed: Sequence[tuple[str, tuple[str, ...]]],
+    ) -> None:
+        """The one extra generation, spent on fresh clues that then go through the normal
+        rules, screening and verification (calls named screen-retry / verify-retry)."""
+        trace.focused_regeneration = "no verified clue leads to its intended words"
+        logger.info("[%s] regeneration: %s", self.team, trace.focused_regeneration)
+        tried, rejected = list(trace.candidates), list(trace.rejected)
+        try:
+            reply = await self._generate(board, race, trace, missed, focus=True, unclear=True)
+        except LLMResponseError as exc:
+            logger.warning("[%s] regeneration failed: %s", self.team, exc)
+            return
+        known = {_stem(c.clue) for c in tried}
+        fresh = [
+            c
+            for c in self._prepare(board, trace, self._plans(board, trace, reply, "retry"))
+            if _stem(c.clue) not in known
+        ]
+        trace.candidates, trace.rejected = tried + fresh, rejected + trace.rejected
+        trace.regenerated = [c.clue for c in fresh]
+        if not fresh:
+            logger.info("[%s] regeneration repeated earlier clues only", self.team)
+            return
+        screened = await self._screen(
+            board, race, trace, self._split_pool(fresh)[0], stage=RETRY_STAGE
+        )
+        trace.screened += screened
+        verified = await self._verify(board, race, trace, screened, stage=RETRY_STAGE)
+        trace.assessments = prune_dominated([*trace.assessments, *verified])
 
     def _needs_focus(self, race: RaceState, pool: Sequence[Candidate]) -> str:
         multi = [c for c in pool if len(c.targets) > 1]
@@ -506,11 +580,12 @@ class SpymasterAgent(Agent):
         missed: Sequence[tuple[str, tuple[str, ...]]],
         *,
         focus: bool,
+        unclear: bool = False,
     ) -> dict[str, Any]:
         cap = self._max_group(race)
         idea_list = {"type": "array", "items": WORD_SCHEMA}
         properties: dict[str, Any] = {}
-        if not focus or not trace.candidates:
+        if not focus or not trace.candidates or unclear:
             properties["words"] = {
                 "type": "object",
                 "properties": {
@@ -602,7 +677,13 @@ class SpymasterAgent(Agent):
                 f"One clue connecting all {race.ours} of your remaining words would win the "
                 "game now; include such a group if any real link exists."
             )
-        if focus and not trace.candidates:
+        if unclear:
+            lines.append(
+                "A teammate who cannot see colours did not connect your earlier clues to the "
+                "words you meant. Give clues that lead clearly to their own target words. Do "
+                "not repeat these clues: " + (", ".join(c.clue for c in trace.candidates) or "-")
+            )
+        elif focus and not trace.candidates:
             lines.append(
                 "Your earlier suggestions were not usable single words. Every idea and clue "
                 "must be ONE real dictionary word."
@@ -625,11 +706,11 @@ class SpymasterAgent(Agent):
         return await timed_chat(
             self.llm,
             trace.calls,
-            "generate-focus" if focus else "generate",
+            "generate-retry" if unclear else "generate-focus" if focus else "generate",
             system=system,
             user="\n".join(lines),
             schema=schema,
-            num_predict=700 if focus else 1000,
+            num_predict=700 if focus and not unclear else 1000,
             temperature=GENERATOR_TEMPERATURE,
         )
 
@@ -653,10 +734,12 @@ class SpymasterAgent(Agent):
         race: RaceState,
         trace: SpymasterTrace,
         candidates: Sequence[Candidate],
+        *,
+        stage: str = "",
     ) -> list[ClueAssessment]:
         if not candidates:
             return []
-        rankings = await self._batched_rankings(board, trace, candidates)
+        rankings = await self._batched_rankings(board, trace, candidates, stage)
         if rankings is None:
             return []  # unassessed candidates are never used
         assessments: list[ClueAssessment] = []
@@ -680,6 +763,8 @@ class SpymasterAgent(Agent):
         race: RaceState,
         trace: SpymasterTrace,
         screened: Sequence[ClueAssessment],
+        *,
+        stage: str = "",
     ) -> list[ClueAssessment]:
         """Re-rank the most promising clue WORDS with the operative's exact request.
 
@@ -719,7 +804,7 @@ class SpymasterAgent(Agent):
                 estimate = max(a.win_probability for a in acts)
                 if best is not None and estimate < best.win_probability - VERIFY_MARGIN:
                     break
-            await self._verify_clue(board, race, trace, clue, final, verified_clues)
+            await self._verify_clue(board, race, trace, clue, final, verified_clues, stage)
         # Rare path: every verified finalist disappointed. Check the best remaining
         # estimate (at most RESCUE_CHECKS more) rather than submit it unverified.
         for _ in range(RESCUE_CHECKS):
@@ -728,7 +813,7 @@ class SpymasterAgent(Agent):
             choice = select_clue(list(final.values()))
             if choice is None or choice.clue in verified_clues:
                 break
-            await self._verify_clue(board, race, trace, choice.clue, final, verified_clues)
+            await self._verify_clue(board, race, trace, choice.clue, final, verified_clues, stage)
         return list(final.values())
 
     async def _verify_clue(
@@ -739,13 +824,14 @@ class SpymasterAgent(Agent):
         clue: str,
         final: dict[tuple[str, int], ClueAssessment],
         verified_clues: set[str],
+        stage: str,
     ) -> None:
         verified_clues.add(clue)
         trace.verified_words.append(clue)
         actions = [a for a in final.values() if a.clue == clue]
         request = single_clue_request(clue, board.unrevealed)
         try:
-            reply = await timed_chat(self.llm, trace.calls, "verify", **request)
+            reply = await timed_chat(self.llm, trace.calls, f"verify{stage}", **request)
         except LLMResponseError as exc:
             logger.warning("[%s] verifying %s failed: %s", self.team, clue, exc)
             return
@@ -770,7 +856,7 @@ class SpymasterAgent(Agent):
             self._log(f"VERIFY {after.clue} {after.number}:", board, after)
 
     async def _batched_rankings(
-        self, board: _Board, trace: SpymasterTrace, candidates: Sequence[Candidate]
+        self, board: _Board, trace: SpymasterTrace, candidates: Sequence[Candidate], stage: str
     ) -> dict[str, tuple[RankedWord, ...]] | None:
         # Colour-blind on purpose: only unrevealed words and clue words, never the key,
         # the intended targets, or the private connection notes.
@@ -779,7 +865,7 @@ class SpymasterAgent(Agent):
             reply = await timed_chat(
                 self.llm,
                 trace.calls,
-                "screen",
+                f"screen{stage}",
                 system=RANKING_SYSTEM,
                 user=ranking_user(board.unrevealed, clues),
                 schema=ranking_schema(clues, board.unrevealed),

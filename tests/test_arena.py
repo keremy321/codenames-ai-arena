@@ -15,8 +15,8 @@ async def test_four_isolated_contexts_and_cleanup(monkeypatch: pytest.MonkeyPatc
         assert client._browser is not None
         original = client._browser.new_context
 
-        async def offline() -> BrowserContext:
-            context = await original()
+        async def offline(**options: object) -> BrowserContext:
+            context = await original(**options)  # type: ignore[arg-type]
             await context.route(
                 "**/*",
                 lambda route: route.fulfill(

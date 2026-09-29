@@ -1,7 +1,9 @@
 """Validate every configured model before any game browser opens.
 
-Ollama is probed over HTTP (and started locally when it is simply not running);
-hosted providers are checked locally only, so startup never spends paid tokens.
+Ollama is probed over HTTP (and started locally when it is simply not running), then
+each distinct Ollama model is warmed with one tiny request so the first spymaster call
+does not pay for loading it. Hosted providers are checked locally only, so startup
+never spends paid tokens.
 """
 
 import asyncio
@@ -12,19 +14,23 @@ import subprocess
 import time
 from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
 import httpx
 
 from codenames_ai.config import Settings
 
-from .base import LLMConfig, LLMHTTPError, LLMModelError
+from .base import LLMConfig, LLMError, LLMHTTPError, LLMModelError
 from .factory import api_key
+from .ollama import OllamaClient, keep_alive_value
 
 logger = logging.getLogger(__name__)
 
 LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 OLLAMA_START_TIMEOUT = 30.0
+# Loading a large model from disk can take minutes on a cold start.
+OLLAMA_WARMUP_TIMEOUT = 300.0
 PROVIDER_NAMES = {"openai": "OpenAI", "anthropic": "Anthropic"}
 
 
@@ -48,9 +54,71 @@ async def fetch_ollama_models(
         raise LLMHTTPError(f"Ollama at {base_url} sent an unexpected model list") from exc
 
 
+def ollama_name(model: str) -> str:
+    """Ollama's full model name: "qwen3" means "qwen3:latest"."""
+    return model if ":" in model else f"{model}:latest"
+
+
 def installed(model: str, names: set[str]) -> bool:
-    # "qwen3" means "qwen3:latest" to Ollama.
-    return (model if ":" in model else f"{model}:latest") in names or model in names
+    return ollama_name(model) in names or model in names
+
+
+async def fetch_loaded_ollama_models(
+    base_url: str, *, timeout: float = 3.0, transport: httpx.AsyncBaseTransport | None = None
+) -> set[str] | None:
+    """Models Ollama currently holds in memory (api/ps), or None when unknown."""
+    try:
+        async with httpx.AsyncClient(
+            base_url=base_url.rstrip("/") + "/", timeout=timeout, transport=transport
+        ) as http:
+            response = await http.get("api/ps")
+        models = response.json().get("models", []) if not response.is_error else None
+        if not isinstance(models, list):
+            return None
+        return {str(m.get("name") or m.get("model")) for m in models if isinstance(m, dict)}
+    except (httpx.RequestError, ValueError, AttributeError):
+        return None
+
+
+@dataclass(frozen=True)
+class WarmUp:
+    model: str
+    seconds: float
+    already_loaded: bool | None  # None: the server did not say
+
+
+async def warm_ollama_model(settings: Settings, model: str) -> None:
+    """One tiny inference with the match's keep_alive; raises if the model cannot run."""
+    async with OllamaClient(
+        settings.ollama_base_url,
+        model,
+        timeout=max(settings.ollama_timeout, OLLAMA_WARMUP_TIMEOUT),
+        keep_alive=keep_alive_value(settings.ollama_keep_alive),
+    ) as client:
+        await client.warm_up()
+
+
+async def warm_ollama(
+    models: Iterable[str], settings: Settings, report: Callable[[str], None]
+) -> list[WarmUp]:
+    """Warm each distinct model once, one after another (never two loads at once)."""
+    loaded = await fetch_loaded_ollama_models(settings.ollama_base_url)
+    results: list[WarmUp] = []
+    for model in dict.fromkeys(models):
+        already = None if loaded is None else installed(model, loaded)
+        started = time.perf_counter()
+        try:
+            await warm_ollama_model(settings, model)
+        except LLMError as exc:
+            raise LLMModelError(f"Ollama model {model} failed its warm-up request: {exc}") from exc
+        seconds = time.perf_counter() - started
+        results.append(WarmUp(model, seconds, already))
+        note = " (already loaded)" if already else ""
+        report(f"Ollama warm-up: {model} ... {seconds:.1f}s{note}")
+        logger.debug(
+            "Ollama warm-up: model=%s seconds=%.2f already_loaded=%s", model, seconds, already
+        )
+    return results
 
 
 def is_local(base_url: str) -> bool:
@@ -109,15 +177,21 @@ async def wait_for_ollama(
 @asynccontextmanager
 async def llm_preflight(
     configs: Iterable[LLMConfig], settings: Settings, *, report: Callable[[str], None] = print
-) -> AsyncIterator[None]:
-    """Fail before the match on an unreachable Ollama, a missing model, or a missing key.
+) -> AsyncIterator[list[WarmUp]]:
+    """Fail before the match on an unreachable Ollama, a missing model, a model that
+    cannot run, or a missing key. Yields the Ollama warm-ups (for the match log).
 
     Ollama started here is stopped on exit; an already running server is left alone.
     """
     distinct = sorted(set(configs), key=str)
     started: subprocess.Popen[bytes] | None = None
     try:
-        ollama = [c.model for c in distinct if c.provider == "ollama"]
+        # "qwen3" and "qwen3:latest" are one model: probed and warmed once.
+        spellings: dict[str, str] = {}
+        for config in distinct:
+            if config.provider == "ollama":
+                spellings.setdefault(ollama_name(config.model), config.model)
+        ollama = list(spellings.values())
         if ollama:
             base_url = settings.ollama_base_url
             names = await fetch_ollama_models(base_url)
@@ -141,7 +215,7 @@ async def llm_preflight(
             if config.provider != "ollama":
                 api_key(config.provider, settings)
                 report(f"{PROVIDER_NAMES[config.provider]} configured: {config.model}")
-        yield
+        yield await warm_ollama(ollama, settings, report) if ollama else []
     finally:
         if started is not None:
             stop_ollama(started)

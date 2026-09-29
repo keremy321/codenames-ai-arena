@@ -18,6 +18,8 @@ class Settings(BaseModel):
     room_url: str = ""
     headless: bool = False
     ollama_timeout: float = Field(default=120, gt=0)
+    # How long Ollama keeps a model loaded after each request (Ollama syntax: "30m", "-1").
+    ollama_keep_alive: str = "30m"
     # Default for every role; an empty model means OLLAMA_MODEL when the provider is ollama.
     llm_provider: Provider = "ollama"
     llm_model: str = ""
@@ -50,6 +52,7 @@ class Settings(BaseModel):
         return cls(
             ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
             ollama_model=os.getenv("OLLAMA_MODEL", "qwen3:14b"),
+            ollama_keep_alive=os.getenv("OLLAMA_KEEP_ALIVE", "").strip() or "30m",
             room_url=os.getenv("CODENAMES_ROOM_URL", ""),
             headless=os.getenv("HEADLESS", "false"),
             llm_provider=os.getenv("LLM_PROVIDER", "").strip().lower() or "ollama",

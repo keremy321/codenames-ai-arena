@@ -55,8 +55,8 @@ async def test_browser_client_context_isolation(monkeypatch: pytest.MonkeyPatch)
         assert client._browser is not None
         original_new_context = client._browser.new_context
 
-        async def routed_context() -> BrowserContext:
-            context = await original_new_context()
+        async def routed_context(**options: object) -> BrowserContext:
+            context = await original_new_context(**options)  # type: ignore[arg-type]
             await context.route(
                 "**/*",
                 lambda route: route.fulfill(
@@ -74,3 +74,27 @@ async def test_browser_client_context_isolation(monkeypatch: pytest.MonkeyPatch)
         await first.pages[0].evaluate("sessionStorage.setItem('identity', 'blue')")
         assert await second.cookies() == []
         assert await second.pages[0].evaluate("sessionStorage.getItem('identity')") is None
+
+
+async def test_browser_client_contexts_request_reduced_motion() -> None:
+    from codenames_ai.browser.client import BrowserClient
+
+    async with BrowserClient(headless=True) as client:
+        assert client._browser is not None
+        options: list[dict[str, object]] = []
+        original_new_context = client._browser.new_context
+
+        async def routed_context(**kwargs: object) -> BrowserContext:
+            options.append(kwargs)
+            context = await original_new_context(**kwargs)  # type: ignore[arg-type]
+            await context.route(
+                "**/*",
+                lambda route: route.fulfill(body="<html>Offline</html>", content_type="text/html"),
+            )
+            return context
+
+        client._browser.new_context = routed_context  # type: ignore[method-assign]
+        context = await client.open_room("https://codenames.game/room/offline")
+        assert options == [{"reduced_motion": "reduce"}]
+        query = "matchMedia('(prefers-reduced-motion: reduce)').matches"
+        assert await context.pages[0].evaluate(query) is True

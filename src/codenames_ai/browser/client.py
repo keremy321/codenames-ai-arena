@@ -28,7 +28,9 @@ class BrowserClient:
             raise ValueError("Room URL must use https://codenames.game/")
         if self._browser is None:
             raise RuntimeError("Use BrowserClient as an async context manager")
-        context = await self._browser.new_context()
+        # Reduced motion shortens the site's card-reveal animation; the state-based waits
+        # still decide when a move is done, so a browser that ignores it stays correct.
+        context = await self._browser.new_context(reduced_motion="reduce")
         try:
             page = await context.new_page()
             await page.goto(room_url, wait_until="domcontentloaded")
