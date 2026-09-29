@@ -204,6 +204,7 @@ class GameController:
                         "guess",
                         team=state.team,
                         word=result.card.word,
+                        index=result.card.index,
                         result=guess_result(state.team, result.card.color),
                         bonus=source_index is not None,
                     )

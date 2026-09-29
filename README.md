@@ -53,10 +53,22 @@ Each match is recorded under `logs/` (ignored by Git) in the directory you run f
 
 ```text
 logs/2026-09-29T001530_radun-kapuf/
-    match.json     room, players' providers and models, start/end times, winner, termination reason
+    match.json     schema_version, room, players' providers and models, start/end times,
+                   winner, termination reason
+    board.json     the initial board key: all 25 cards with index, word and side, plus the
+                   starting team (read once from the spymaster view; never shown to agents)
     events.jsonl   one JSON object per event: clues, guesses, turn changes, agent decisions with
                    LLM call timings, errors, and the final result
 ```
+
+Replay a recorded match locally (no browser, model or network):
+
+```powershell
+python -m codenames_ai.replay logs/2026-09-29T001530_radun-kapuf
+python -m codenames_ai.replay logs/2026-09-29T001530_radun-kapuf --json   # summary only
+```
+
+Replay applies the events in file order and checks them against the board: every guess must name a board word whose side matches the recorded result, no card is revealed twice, and the recorded winner must match the reconstructed game. Logs recorded before `schema_version` 1 have no board snapshot and cannot be replayed.
 
 Each guess also writes one `browser_action` event with the milliseconds spent in each browser stage (selecting the card, the confirmation, the reveal, and the observer catching up). Spymaster decisions list `generator_targets` (the words the clue was generated for), `expected_guesses` (what the operative likely finds with the chosen number), `predicted_ranking`, and `verification_ran` / `verification_passed`. If room creation fails, the log directory gets a `startup_failure` event and a `startup_failure.png` screenshot. A crash still leaves the events recorded so far, and `match.json` shows the error. Logs never contain API keys. If writing a log fails, the game continues and the error is reported once.
 

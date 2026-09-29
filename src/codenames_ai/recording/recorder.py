@@ -25,11 +25,17 @@ from codenames_ai.domain.models import (
 )
 from codenames_ai.llm.base import LLMConfig
 
+from .board import BOARD_FILE, BoardSnapshot
+
 logger = logging.getLogger(__name__)
 
 # Relative to the working directory: the repository root when run as documented.
 LOGS_DIR = Path("logs")
 REDACTED = "[REDACTED]"
+# Version of the match directory format (match.json, events.jsonl, board.json).
+# 1: board.json holds the initial key; guess events carry the card index.
+# Logs without a version predate replay.
+SCHEMA_VERSION = 1
 
 
 def now() -> datetime:
@@ -54,11 +60,13 @@ class MatchRecorder:
         self._secrets = [value for value in secret_values if value and len(value) >= 8]
         self._failed = False
         self._finished = False
+        self._board_recorded = False
         self._started_clock: float | None = None
         code = room_code(room_url)
         self.match_id = f"{self.created:%Y-%m-%dT%H%M%S}_{code or secrets.token_hex(3)}"
         self.directory = root / self.match_id
         self.metadata: dict[str, Any] = {
+            "schema_version": SCHEMA_VERSION,
             "match_id": self.match_id,
             "room_url": room_url,
             "room_code": code,
@@ -96,6 +104,35 @@ class MatchRecorder:
     @property
     def metadata_path(self) -> Path:
         return self.directory / "match.json"
+
+    @property
+    def board_path(self) -> Path:
+        return self.directory / BOARD_FILE
+
+    def record_board(self, snapshot: BoardSnapshot) -> bool:
+        """Write the initial board key once (replay/evaluation only); later calls are
+        refused so the ground truth can never be overwritten mid-match."""
+        if self._board_recorded:
+            logger.warning("Board snapshot already recorded; ignoring a second one")
+            return False
+        self._board_recorded = True
+        text = self._dumps(snapshot.to_json(SCHEMA_VERSION), indent=2) + "\n"
+        written = False
+
+        def write() -> None:
+            nonlocal written
+            self._replace(self.board_path, text)
+            written = True
+
+        self._write(write)
+        if written:
+            self.event(
+                "board_snapshot",
+                file=BOARD_FILE,
+                source=snapshot.source,
+                starting_team=snapshot.starting_team,
+            )
+        return written
 
     def event(self, type: str, **fields: Any) -> None:
         record = {"type": type, "timestamp": now().isoformat(timespec="milliseconds"), **fields}
@@ -153,12 +190,16 @@ class MatchRecorder:
 
     def _write_metadata(self) -> None:
         def write() -> None:
-            # Replace atomically: a crash never leaves a half-written match.json.
-            temporary = self.metadata_path.with_suffix(".json.tmp")
-            temporary.write_text(self._dumps(self.metadata, indent=2) + "\n", encoding="utf-8")
-            os.replace(temporary, self.metadata_path)
+            self._replace(self.metadata_path, self._dumps(self.metadata, indent=2) + "\n")
 
         self._write(write)
+
+    @staticmethod
+    def _replace(path: Path, text: str) -> None:
+        # Replace atomically: a crash never leaves a half-written JSON file.
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(text, encoding="utf-8")
+        os.replace(temporary, path)
 
     def _write(self, action: Any) -> None:
         if self._failed:

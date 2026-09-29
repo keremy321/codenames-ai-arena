@@ -629,3 +629,104 @@ async def test_one_browser_action_event_per_guess_with_controller_stages(tmp_pat
         "observer_sync",
     ]
     assert lines.index(timing) == len(lines) - 1  # written after the observer caught up
+
+
+# --- board snapshot and replay: recorded ground truth never reaches an agent -------
+
+
+class Inputs:
+    """Wraps a debug agent and keeps every state it was given."""
+
+    def __init__(self, agent: object) -> None:
+        self.agent, self.seen = agent, []
+
+    async def choose_clue(self, state: SpymasterGameState) -> ClueDecision:
+        self.seen.append(state)
+        return await self.agent.choose_clue(state)  # type: ignore[attr-defined]
+
+    async def choose_guesses(
+        self, state: PublicGameState, *, guesses_made: int, max_guesses: int
+    ) -> GuessDecision:
+        self.seen.append(state)
+        return await self.agent.choose_guesses(  # type: ignore[attr-defined]
+            state, guesses_made=guesses_made, max_guesses=max_guesses
+        )
+
+
+def scripted_match(tmp_path=None):
+    """Blue SOUND 2: NOTE then pass; red TINY 1: DWARF then pass; blue CAPITAL 1: SKULL."""
+    from boards import standard_cards
+
+    from codenames_ai.recording import MatchRecorder
+
+    game = SharedGame(cards=standard_cards())
+    phases = [GamePhase(f"{team}_{role}") for team in Team for role in Role]
+    players = {p: FakePlayer(p, game) for p in phases}
+    spies = {
+        GamePhase.BLUE_SPYMASTER: Inputs(
+            DebugSpymasterAgent(
+                [ClueDecision(word="SOUND", number=2), ClueDecision(word="CAPITAL", number=1)]
+            )
+        ),
+        GamePhase.RED_SPYMASTER: Inputs(DebugSpymasterAgent([ClueDecision(word="TINY", number=1)])),
+    }
+    ops = {
+        GamePhase.BLUE_OPERATIVE: Inputs(
+            DebugOperativeAgent(
+                [
+                    GuessDecision(indices=(0,)),
+                    GuessDecision(end_turn=True),
+                    GuessDecision(indices=(24,)),
+                ]
+            )
+        ),
+        GamePhase.RED_OPERATIVE: Inputs(
+            DebugOperativeAgent([GuessDecision(indices=(9,)), GuessDecision(end_turn=True)])
+        ),
+    }
+    recorder = None
+    if tmp_path is not None:
+        recorder = MatchRecorder(tmp_path, room_url="https://codenames.game/r/replay", players={})
+    control = GameController(players, spies, ops, timeout=0.2, recorder=recorder)
+    return control, players, recorder, [*spies.values(), *ops.values()]
+
+
+async def test_recorded_live_match_replays_to_the_same_result(tmp_path) -> None:
+    from codenames_ai.recording import capture_board
+    from codenames_ai.replay import load_replay
+
+    control, players, recorder, _ = scripted_match(tmp_path)
+    spymaster = players[GamePhase.BLUE_SPYMASTER]
+    assert await capture_board(spymaster.state, recorder, source="blue_spymaster")
+    recorder.start()
+    await control.run()
+    recorder.finish(reason="game_over", winner=control.winner)
+    replay = load_replay(recorder.directory)
+    assert control.winner == Team.RED  # blue revealed the assassin
+    assert (replay.state.winner, replay.state.decided_by) == (Team.RED, "assassin")
+    assert [(t.team, t.clue, [g.word for g in t.guesses]) for t in replay.state.turns] == [
+        (Team.BLUE, "SOUND", ["NOTE"]),
+        (Team.RED, "TINY", ["DWARF"]),
+        (Team.BLUE, "CAPITAL", ["SKULL"]),
+    ]
+    assert replay.summary.assassin_hits == 1 and not replay.state.warnings
+
+
+async def test_board_recording_does_not_change_any_agent_input(tmp_path) -> None:
+    from codenames_ai.recording import capture_board
+
+    recorded, players, recorder, recorded_agents = scripted_match(tmp_path)
+    await capture_board(players[GamePhase.BLUE_SPYMASTER].state, recorder, source="blue_spymaster")
+    await recorded.run()
+    plain, _, _, plain_agents = scripted_match()  # no recorder, no snapshot
+    await plain.run()
+    assert (recorder.directory / "board.json").exists()
+    for with_board, without in zip(recorded_agents, plain_agents, strict=True):
+        assert [s.model_dump_json() for s in with_board.seen] == [
+            s.model_dump_json() for s in without.seen
+        ]
+    operative_inputs = [s for agent in recorded_agents[2:] for s in agent.seen]
+    assert operative_inputs and all(type(s) is PublicGameState for s in operative_inputs)
+    for state in operative_inputs:
+        assert all(c.color is None for c in state.cards if not c.revealed)
+        assert "assassin" not in state.model_dump_json()  # SKULL is never revealed to them
