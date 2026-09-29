@@ -23,7 +23,13 @@ from codenames_ai.llm.base import PROVIDERS, LLMClient, LLMConfig, LLMError
 from codenames_ai.llm.factory import open_llm_clients
 from codenames_ai.llm.ollama import OllamaClient, OllamaError
 from codenames_ai.llm.preflight import WarmUp, llm_preflight
-from codenames_ai.recording import LOGS_DIR, MatchRecorder, RecordedOperative, RecordedSpymaster
+from codenames_ai.recording import (
+    LOGS_DIR,
+    MatchRecorder,
+    RecordedOperative,
+    RecordedSpymaster,
+    capture_board,
+)
 
 ARENA_ROLES = [
     (Team.BLUE, Role.SPYMASTER),
@@ -152,6 +158,15 @@ async def play_match(
         await arena.wait_for_start(timeout=args.wait_seconds)
         print("Game started.\n", flush=True)
         recorder.start()
+        # The key goes to board.json only (replay/evaluation); nothing is returned to
+        # the controller or any agent.
+        reader = arena.players[GamePhase.BLUE_SPYMASTER].reader
+        if await capture_board(
+            lambda: reader.read_spymaster_state(Team.BLUE),
+            recorder,
+            source=GamePhase.BLUE_SPYMASTER.value,
+        ):
+            print("Board snapshot recorded.", flush=True)
         print(f"Recording: {recorder.directory.as_posix()}/\n", flush=True)
 
         def agent(team: Team, role: Role) -> RecordedSpymaster | RecordedOperative:

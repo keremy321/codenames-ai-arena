@@ -3,10 +3,12 @@ import builtins
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlparse
 
 import pytest
+from boards import spymaster_state
 from playwright.async_api import BrowserContext, Page, Route
 
 import codenames_ai.browser.arena as arena_module
@@ -18,8 +20,8 @@ from codenames_ai.browser.host import Host, RoomCreationError, is_room_url
 from codenames_ai.browser.identity import NICKNAME_CONFIRM_DELAY
 from codenames_ai.browser.selectors import ROLE_PANELS
 from codenames_ai.config import Settings
-from codenames_ai.domain.enums import Role, Team
-from codenames_ai.domain.models import PlayerAssignment
+from codenames_ai.domain.enums import GamePhase, Role, Team
+from codenames_ai.domain.models import PlayerAssignment, SpymasterGameState
 from codenames_ai.llm.base import LLMConfig
 from codenames_ai.llm.preflight import WarmUp
 from codenames_ai.recording import RecordedOperative, RecordedSpymaster
@@ -280,9 +282,16 @@ class Flow:
             async def close(self) -> None:
                 flow.steps.append("host close")
 
+        class FakeReader:
+            async def read_spymaster_state(self, team: Team) -> SpymasterGameState:
+                flow.steps.append("board read")
+                return spymaster_state(team)
+
         class FakeArena:
             def __init__(self, browser: object) -> None:
-                self.players: dict = {}
+                self.players: dict = {
+                    GamePhase.BLUE_SPYMASTER: SimpleNamespace(reader=FakeReader())
+                }
 
             async def open(self, room: str) -> None:
                 flow.steps.append(f"open {room}")
@@ -351,6 +360,7 @@ async def test_automatic_flow_needs_no_terminal_enter_to_start(
         "host sees players",
         "start_game",  # only after all four joined and verified
         "game live",
+        "board read",  # the key is captured once, before any clue
         "controller",
         "arena close",
         "host close",
@@ -377,6 +387,7 @@ async def test_existing_room_is_joined_without_creating_one(
         "open https://codenames.game/r/existing",
         "verify",
         "game live",
+        "board read",  # the key is captured once, before any clue
         "controller",
         "arena close",
     ]
@@ -396,7 +407,13 @@ async def test_crash_finalizes_match_with_error(
     assert meta["termination_reason"] == "error"
     assert meta["error"] == "BrowserIntegrationError: lobby changed"
     types = [json.loads(line)["type"] for line in (match / "events.jsonl").open()]
-    assert types == ["room_ready", "players_ready", "match_started", "match_ended"]
+    assert types == [
+        "room_ready",
+        "players_ready",
+        "match_started",
+        "board_snapshot",
+        "match_ended",
+    ]
     for path in match.iterdir():
         assert "sk-ant-SECRET" not in path.read_text("utf-8")
 
